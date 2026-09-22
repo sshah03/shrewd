@@ -28,7 +28,7 @@ Some findings may be useful even if you never use the library:
 
 I used established methods. Most experiments weren't repeated with different data splits
 and training seeds, so small score differences need more testing. I'm sharing the code
-to make trying this on your own task easier. [BENCHMARKS.md](BENCHMARKS.md) has the
+to make trying this on your own task easier. [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md) has the
 measurements, limits, and alternatives.
 
 I'd especially like to hear which findings hold up on other people's data.
@@ -46,7 +46,7 @@ pool CSV (text only)  ──▶ [3] the teacher labels or judges the pool
 ```
 
 **Part 1** covers using it. **Part 2** covers the findings and their limits, with fuller
-tables in [BENCHMARKS.md](BENCHMARKS.md). The repo includes pipeline examples and panel
+tables in [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md). The repo includes pipeline examples and panel
 rebuilds. Some research results came from private experiment scripts that aren't included.
 
 ---
@@ -352,7 +352,7 @@ An optional real-API smoke test runs with `SHREWD_E2E=1 pytest tests/test_e2e.py
 
 Every score below is against labels that didn't come from the teacher: human annotations,
 issue tags, the product a consumer picked for their own complaint, and synthetic PII
-annotations. Each table says which rows were scored. [BENCHMARKS.md](BENCHMARKS.md) has the
+annotations. Each table says which rows were scored. [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md) has the
 fuller methods and tables, and says what you can and can't rerun from this repo.
 
 ## What I tried
@@ -364,7 +364,7 @@ with a stronger `reflection_model`. On 20 Newsgroups it added nothing. GEPA's ow
 score tends to overstate the gain, so check it against the test set. On a decision panel,
 optimizing the prompt added about 0.03 teacher AUROC on GoEmotions and the student kept
 roughly a third of that. Details are in
-[BENCHMARKS.md](BENCHMARKS.md#prompt-optimization).
+[BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md#prompt-optimization).
 
 I then tried changing the teacher, student, training targets, and choice of rows to label.
 The tables below cover what helped and what didn't. There are still things I haven't
@@ -387,7 +387,7 @@ mistakes.
 
 Macro-F1 for the teacher and the best student, scored on the same rows. Full tables,
 per-student latency and size, the confidence-signal study, and example commands are in
-[BENCHMARKS.md](BENCHMARKS.md).
+[BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md).
 
 | dataset | classes | rows scored | teacher | best student | tfidf student |
 |---|---|---|---|---|---|
@@ -427,7 +427,7 @@ fresh holdout.
 If you already run an LLM classifier in production and want to keep the LLM as a fallback,
 look at [TRACER](https://github.com/adrida/tracer). There's a comparison with it and with
 DSPy, Autolabel, Cleanlab and the annotation tools in
-[BENCHMARKS.md](BENCHMARKS.md#compared-to-other-tools).
+[BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md#compared-to-other-tools).
 
 ## What the pipeline guards
 
@@ -544,7 +544,7 @@ documents x 8 questions in 130 ms on one core, about 246,000 answers a second.
 - Gating the stack on agreement with the teacher on the pool. That said +4 where hand
   labels said -0.3.
 
-Details are in [BENCHMARKS.md](BENCHMARKS.md#what-does-not-work).
+Details are in [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md#what-does-not-work).
 
 ### Comparison with Laya
 
@@ -554,7 +554,7 @@ six of eight datasets and had lower ECE on all eight. Laya led on AG News and Go
 (0.907 vs 0.858 here on the latter). Training data, architecture and calibration all
 differ between the two, so this doesn't tell you which architecture is better. The
 100-25,000x speedups are for the tf-idf and embedding students. Full numbers and how I
-prompted Laya are in [BENCHMARKS.md](BENCHMARKS.md#every-student-on-every-dataset).
+prompted Laya are in [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md#every-student-on-every-dataset).
 
 ## Labeling under a budget
 
