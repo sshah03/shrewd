@@ -718,3 +718,14 @@ def test_a_bare_student_treats_auto_as_the_safe_choice():
 
     assert resolve_features("auto") == "tfidf"
 
+
+
+def test_loading_a_model_without_its_extra_names_the_install(monkeypatch):
+    import importlib.util
+
+    from shrewd import decisions
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(ImportError, match=r'pip install "shrewd\[embed\]"'):
+        decisions._check_extra("embed")
+    decisions._check_extra("tfidf")  # needs nothing extra

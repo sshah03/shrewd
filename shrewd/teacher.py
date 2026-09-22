@@ -8,7 +8,7 @@ import time
 import warnings
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import litellm
 import pandas as pd
@@ -104,7 +104,7 @@ def _cache_put(conn, key, response, model):
     with _cache_lock:
         conn.execute(
             "INSERT OR REPLACE INTO calls VALUES (?, ?, ?, ?)",
-            (key, response, model, datetime.now(timezone.utc).isoformat()),
+            (key, response, model, datetime.now(UTC).isoformat()),
         )
         conn.commit()
 

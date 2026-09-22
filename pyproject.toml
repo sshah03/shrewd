@@ -9,16 +9,22 @@ description = "Turn LLM judgments into a small, fast, local text model for one f
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 # the core is what inference needs; training pulls in the LLM stack via [teacher]
 dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",
-    "scikit-learn>=1.3",
+    # the pre-built panels were pickled with this version; others warn on load
+    "scikit-learn==1.9.0",
     "scipy>=1.10",
     "tqdm>=4.66",
     "joblib>=1.3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/sshah03/shrewd"
+Repository = "https://github.com/sshah03/shrewd"
+Issues = "https://github.com/sshah03/shrewd/issues"
 
 [project.optional-dependencies]
 # exact gepa pin: the glue in optimize.py is verified against this version's adapter

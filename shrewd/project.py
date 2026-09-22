@@ -7,7 +7,7 @@ import time
 import warnings
 from collections import Counter
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -84,7 +84,7 @@ class Project:
         self._manifest["stages"].append(
             {
                 "name": name,
-                "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "completed_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "cost_usd": round(cost, 4),
                 "params": params,
             }

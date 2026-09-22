@@ -15,6 +15,7 @@ the result is distilled into one featurization with a calibrated head per questi
 import json
 import shutil
 import warnings
+from datetime import UTC
 from pathlib import Path
 
 import numpy as np
@@ -194,6 +195,20 @@ class _Model2VecFeatures:
 
     def fit_transform(self, texts, y=None):
         return self.fit(texts).transform(texts)
+
+
+def _check_extra(kind):
+    """Fail with an install hint, not a pickle error, when a saved model's extra is missing."""
+    import importlib.util
+
+    from shrewd.students import REQUIRES
+
+    for module in REQUIRES.get(kind, ()):
+        if importlib.util.find_spec(module) is None:
+            raise ImportError(
+                f'this model uses {kind} features, which need {module}: '
+                f'pip install "shrewd[{kind}]"'
+            )
 
 
 class _ConstantHead:
@@ -516,6 +531,7 @@ class DecisionStudent:
 
         path = Path(path)
         questions = {k: decide.from_dict(v) for k, v in meta["questions"].items()}
+        _check_extra(meta.get("features", "tfidf"))
         blob = joblib.load(path / "model.joblib")
         # the fitted featurizer comes back from joblib whatever it was, so build the
         # student around a placeholder rather than trying to reconstruct a custom
@@ -852,11 +868,11 @@ class Decisions:
         os.replace(tmp, self.dir / "manifest.json")
 
     def _record_stage(self, name, cost, **params):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         self._manifest["stages"].append({
             "name": name,
-            "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "completed_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "cost_usd": round(cost, 4),
             "params": params,
         })

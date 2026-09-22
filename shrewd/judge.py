@@ -10,7 +10,7 @@ import hashlib
 import json
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
@@ -271,7 +271,7 @@ def _answer_put(conn, model, key, question, state, vec, header=None):
                 _answer_key(model, key, question, state, header),
                 json.dumps([round(float(v), 6) for v in vec]),
                 model,
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
         conn.commit()

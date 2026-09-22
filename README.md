@@ -271,6 +271,8 @@ only ever answered by the teacher, and ship that way.
   [`panels-v1` release](https://github.com/sshah03/shrewd/releases/tag/panels-v1). `load()`
   takes the asset URL, downloads it once into `~/.cache/shrewd/`, and serves it from there.
   `messages` and `pii` (encoder) are ~550 MB and `email` and `guardrail` are under 30 MB.
+  `email` works with the plain install. `guardrail` needs `pip install "shrewd[embed]"`, and
+  `messages` and `pii` need `pip install "shrewd[encoder]"`.
 - **Rebuild without a teacher.** `python examples/panels/build.py pii --from-judged`
   retrains from Fable 5.1's answers, which are committed under `examples/panels/judged/`.
   No API calls. It takes seconds for tf-idf or embeddings and ~25 min on a GPU for the
