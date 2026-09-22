@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shrewd"
+dynamic = ["version"]
+description = "Turn LLM judgments into a small, fast, local text model for one fixed task."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+# the core is what inference needs; training pulls in the LLM stack via [teacher]
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+    "scipy>=1.10",
+    "tqdm>=4.66",
+    "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+# exact gepa pin: the glue in optimize.py is verified against this version's adapter
+# internals (gepa is 0.x with a moving API)
+teacher = ["litellm>=1.70", "gepa==0.1.4"]
+embed = ["model2vec>=0.3"]
+setfit = ["setfit>=1.1", "transformers<5"]
+encoder = ["torch>=2.2", "transformers>=4.48,<5"]
+all = [
+    "litellm>=1.70", "gepa==0.1.4",
+    "model2vec>=0.3", "setfit>=1.1", "torch>=2.2", "transformers>=4.48,<5",
+]
+dev = ["pytest>=8", "ruff>=0.5", "litellm>=1.70", "gepa==0.1.4"]
+
+[tool.hatch.version]
+path = "shrewd/__init__.py"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
