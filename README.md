@@ -1,7 +1,7 @@
 # shrewd
 
 [![PyPI](https://img.shields.io/pypi/v/shrewd)](https://pypi.org/project/shrewd/)
-[![Python](https://img.shields.io/pypi/pyversions/shrewd)](https://pypi.org/project/shrewd/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/shrewd/)
 [![CI](https://github.com/sshah03/shrewd/actions/workflows/ci.yml/badge.svg)](https://github.com/sshah03/shrewd/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/sshah03/shrewd/blob/main/LICENSE)
 
