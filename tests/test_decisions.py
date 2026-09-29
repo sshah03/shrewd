@@ -6,7 +6,14 @@ import pytest
 from conftest import QUESTIONS, fake_answer, make_docs
 
 from shrewd import decide
-from shrewd.calibrate import Calibrator, calibration_metrics, cross_fit_proba, ece
+from shrewd.calibrate import (
+    Calibrator,
+    brier,
+    brier_decomposition,
+    calibration_metrics,
+    cross_fit_proba,
+    ece,
+)
 from shrewd.decide import Choice, Noul, Score
 from shrewd.decisions import Decisions, DecisionStudent, gold_index, question_metrics
 
@@ -166,6 +173,64 @@ def test_calibrator_round_trips_through_json():
         assert np.allclose(clone.transform(proba), cal.transform(proba))
 
 
+def _biased_three_way(n, seed):
+    """True distribution softmax(z); the head reports softmax(2z + bias): overconfident and
+    tilted toward option 1, which a map on the top score alone can't undo."""
+    from shrewd.calibrate import _softmax
+
+    rng = np.random.default_rng(seed)
+    z = rng.normal(size=(n, 3)) * 1.5
+    y = np.array([rng.choice(3, p=row) for row in _softmax(z)])
+    return _softmax(2.0 * z + np.array([0.0, 1.0, -1.0])), y
+
+
+def test_full_vector_maps_undo_a_per_option_bias():
+    from shrewd.calibrate import nll
+
+    proba, y = _biased_three_way(6000, 12)
+    labels, classes = [str(v) for v in y], ["0", "1", "2"]
+    fit, held = slice(0, 4000), slice(4000, None)
+    losses, rates = {}, {}
+    for method in ("temperature", "platt", "vector", "matrix"):
+        cal = Calibrator.fit(proba[fit], labels[fit], classes, method=method)
+        out = cal.transform(proba[held])
+        losses[method], rates[method] = nll(out, y[held]), out.mean(axis=0)
+    truth = np.bincount(y[held], minlength=3) / len(y[held])
+    for method in ("vector", "matrix"):
+        assert losses[method] < losses["temperature"] - 0.02
+        assert np.abs(rates[method] - truth).max() < 0.02
+    # the top-score map leaves option 1 over-stated
+    assert np.abs(rates["platt"] - truth).max() > 0.05
+
+
+def test_auto_never_picks_a_full_vector_map():
+    """`auto` is what existing projects use; widening it would change their predictions."""
+    proba, y = _biased_three_way(3000, 13)
+    cal = Calibrator.fit(proba, [str(v) for v in y], ["0", "1", "2"], method="auto")
+    assert cal.method in ("temperature", "isotonic", "platt", "none")
+    wide = Calibrator.fit(proba, [str(v) for v in y], ["0", "1", "2"], method="auto-full")
+    assert wide.method in ("vector", "matrix")
+
+
+def test_full_vector_maps_round_trip_and_stay_sane_on_a_rare_option():
+    rng = np.random.default_rng(14)
+    y = np.array([0] * 900 + [1] * 98 + [2] * 2)       # option 2: two rows
+    proba = np.clip(np.eye(3)[y] * 0.6 + rng.dirichlet([1, 1, 1], size=1000) * 0.4, 1e-6, 1)
+    proba /= proba.sum(axis=1, keepdims=True)
+    for method in ("vector", "matrix"):
+        cal = Calibrator.fit(proba, [str(v) for v in y], ["0", "1", "2"], method=method)
+        out = cal.transform(proba)
+        assert np.isfinite(out).all() and np.allclose(out.sum(axis=1), 1.0)
+        assert out[:, 2].mean() < 0.02                   # a rare option stays rare
+        clone = Calibrator.from_dict(json.loads(json.dumps(cal.to_dict())))
+        assert np.allclose(clone.transform(proba), out, atol=1e-5)
+
+
+def test_loading_an_unknown_calibrator_says_to_upgrade():
+    with pytest.raises(ValueError, match="newer shrewd"):
+        Calibrator.from_dict({"method": "from-the-future", "params": {}})
+
+
 def test_auto_declines_to_calibrate_on_too_little():
     rng = np.random.default_rng(3)
     proba = rng.dirichlet([1, 1], size=10)
@@ -221,6 +286,54 @@ def test_noul_metrics_report_the_base_rate():
     stats = question_metrics(QUESTIONS["angry"], proba, gold)
     assert stats["base_rate"] == pytest.approx(0.05)
     assert stats["type"] == "noul"
+
+
+def test_brier_decomposition_adds_up_to_brier():
+    rng = np.random.default_rng(9)
+    y = rng.integers(0, 3, size=5000)
+    proba = rng.dirichlet([1, 1, 1], size=5000)
+    proba[np.arange(5000), y] += 0.5
+    proba /= proba.sum(axis=1, keepdims=True)
+    parts = brier_decomposition(proba, y)
+    total = parts["reliability"] - parts["resolution"] + parts["uncertainty"]
+    # equal-mass bins drop the within-bin spread, so the identity is close, not exact
+    assert total == pytest.approx(brier(proba, y), abs=0.02)
+
+
+def test_base_rate_forecaster_has_no_resolution():
+    """Perfectly calibrated and useless: the case ECE can't flag and resolution can."""
+    rng = np.random.default_rng(10)
+    y = rng.integers(0, 3, size=3000)
+    rates = np.bincount(y, minlength=3) / len(y)
+    flat = np.tile(rates, (3000, 1))
+    stats = calibration_metrics(flat, [str(v) for v in y], ["0", "1", "2"])
+    assert stats["ece"] < 0.05          # bin sampling noise on a constant forecast
+    assert stats["resolution_share"] < 0.01
+    sharp = np.eye(3)[y] * 0.8 + 0.2 / 3
+    assert calibration_metrics(sharp, [str(v) for v in y], ["0", "1", "2"])[
+        "resolution_share"] > 0.9
+
+
+def test_noul_decomposition_is_on_p_yes():
+    gold = np.array([1] * 20 + [0] * 80)
+    p_yes = np.where(gold == 1, 0.8, 0.1)
+    proba = np.column_stack([1 - p_yes, p_yes])
+    stats = question_metrics(QUESTIONS["angry"], proba, gold)
+    assert stats["brier_unc"] == pytest.approx(0.2 * 0.8, abs=1e-4)
+    assert stats["brier_rel"] - stats["brier_res"] + stats["brier_unc"] == \
+        pytest.approx(stats["brier"], abs=1e-3)
+
+
+def test_uninformative_choice_head_is_a_finding():
+    from shrewd.decisions import decision_findings
+
+    rng = np.random.default_rng(11)
+    gold = rng.integers(0, 3, size=600)
+    flat = np.tile(np.bincount(gold, minlength=3) / 600, (600, 1))
+    stats = question_metrics(QUESTIONS["department"], np.pad(flat, ((0, 0), (0, 1)),
+                                                             constant_values=1e-6), gold)
+    findings = decision_findings({"questions": {"department": {"student": stats}}})
+    assert any("uninformative" in f.title for f in findings)
 
 
 def test_score_metrics_use_distance_not_just_accuracy():
@@ -312,6 +425,22 @@ def test_full_pipeline_offline(tmp_path, decision_teacher):
     assert answers["department"].choice in QUESTIONS["department"].options()
     assert 0.0 <= answers["angry"].noul <= 1.0
     assert 0.0 <= answers["severity"].score <= 2.0
+
+
+def test_distill_with_full_vector_calibration(tmp_path, decision_teacher):
+    docs = make_docs(240)
+    d = Decisions(tmp_path / "panel", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[:120], test_frac=0.4)
+    d.judge(docs.iloc[120:][["text"]])
+    d.distill(features="tfidf", calibration="auto-full")
+
+    from shrewd import load
+
+    loaded = load(tmp_path / "panel")
+    assert set(loaded.calibrators) == set(QUESTIONS)
+    proba = loaded.predict_proba(["ticket 7: charged twice for the refund"])
+    for values in proba.values():
+        assert np.allclose(values.sum(axis=1), 1.0)
 
 
 def test_one_teacher_call_per_document(tmp_path, decision_teacher):

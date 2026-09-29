@@ -11,6 +11,8 @@
 
 Only some questions per panel have public labels. Each guardrail row carries labels only
 for the questions its source annotated.
+
+Needs `pip install huggingface_hub pyarrow` on top of shrewd.
 """
 
 import json
@@ -19,7 +21,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from huggingface_hub import hf_hub_download
+
+try:
+    import pyarrow  # noqa: F401  (pandas needs it to read the parquet files)
+    from huggingface_hub import hf_hub_download
+except ImportError as exc:
+    raise SystemExit(f"fetch.py needs {exc.name}: pip install huggingface_hub pyarrow") from exc
 
 OUT = Path(__file__).resolve().parent.parent.parent / "data"
 SEED_ROWS, POOL_ROWS, HOLDOUT_ROWS = 500, 1500, 4000

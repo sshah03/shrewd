@@ -1,19 +1,25 @@
 """Post-hoc calibration of a student's probabilities.
 
-With more than two options the calibration map runs on the top score, so the predicted
-option never changes. For yes/no questions the calibrated quantity is P(yes) itself and it
+With more than two options the `auto` methods map the top score, so the predicted option
+never changes. `vector` and `matrix` (opt-in) rescale every option's log-probability instead:
+they can lift an option the head under-states, which also means they can change the
+predicted option. For yes/no questions the calibrated quantity is P(yes) itself and it
 may cross 0.5: a question with a 3% base rate should not sit at 0.5.
 See `cross_fit_proba` for which rows the calibrator is fit on.
 """
 
 import numpy as np
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize, minimize_scalar
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 
 EPS = 1e-12
 METHODS = ("temperature", "isotonic", "platt", "none")
+# maps that move every option's probability, not only the winner's. Opt-in: `auto` keeps
+# searching METHODS only, so upgrading doesn't change which option an existing panel predicts
+FULL_METHODS = ("vector", "matrix")
+KNOWN_METHODS = METHODS + FULL_METHODS
 
 
 def _logits(proba):
@@ -55,6 +61,49 @@ def brier(proba, y_idx):
     """
     proba = np.asarray(proba, dtype=float)
     return float(np.mean(((proba - _onehot(y_idx, proba.shape[1])) ** 2).sum(axis=1)))
+
+
+def brier_decomposition(proba, y_idx, bins=10):
+    """Murphy's split of the Brier score: reliability - resolution + uncertainty.
+
+    Reliability is the calibration error (lower is better), resolution is how far the
+    forecasts move away from the base rate where the outcomes do (higher is better), and
+    uncertainty is the base rate's own Brier score, which no model changes. A head that
+    answers the base rate on every row has zero reliability error and zero resolution,
+    which ECE alone can't tell apart from a good head. Each option is scored one-vs-rest
+    on equal-mass bins of its probability and the parts are summed, so they add up to
+    `brier()` up to the within-bin spread. For a yes/no question pass the P(yes) column
+    alone to get the binary scale.
+    """
+    proba = np.asarray(proba, dtype=float)
+    if proba.ndim == 1:
+        proba = proba[:, None]
+        outcome = np.asarray(y_idx, dtype=float)[:, None]
+    else:
+        outcome = _onehot(y_idx, proba.shape[1])
+    rel = res = unc = 0.0
+    n = len(proba)
+    if n == 0:
+        return {"reliability": float("nan"), "resolution": float("nan"),
+                "uncertainty": float("nan")}
+    for j in range(proba.shape[1]):
+        p, o = proba[:, j], outcome[:, j]
+        rate = o.mean()
+        unc += rate * (1 - rate)
+        order = np.argsort(p, kind="mergesort")
+        for chunk in np.array_split(order, min(bins, n)):
+            if len(chunk):
+                w = len(chunk) / n
+                rel += w * (p[chunk].mean() - o[chunk].mean()) ** 2
+                res += w * (o[chunk].mean() - rate) ** 2
+    return {"reliability": float(rel), "resolution": float(res), "uncertainty": float(unc)}
+
+
+def resolution_share(parts):
+    """Resolution as a share of uncertainty: 0 for a base-rate forecaster, 1 for a perfect one.
+    It shrinks with the base rate even at a fixed AUROC (AUROC 0.8 is ~0.07 at a 3% rate and
+    ~0.27 at 50%), so compare it across heads of the same question, not across questions."""
+    return parts["resolution"] / parts["uncertainty"] if parts["uncertainty"] > 0 else float("nan")
 
 
 def ece(confidence, correct, bins=10):
@@ -127,6 +176,7 @@ def calibration_metrics(proba, labels, classes, bins=10):
         confidence = proba.max(axis=1)
         correct = (proba.argmax(axis=1) == y_idx).astype(float)
     accuracy = float((proba.argmax(axis=1) == y_idx).mean())
+    parts = brier_decomposition(proba, y_idx, bins)
     return {
         "n": int(len(y_idx)),
         "accuracy": round(accuracy, 4),
@@ -134,6 +184,10 @@ def calibration_metrics(proba, labels, classes, bins=10):
         "overconfidence": round(float(confidence.mean() - correct.mean()), 4),
         "ece": round(ece(confidence, correct, bins), 4),
         "brier": round(brier(proba, y_idx), 4),
+        "brier_rel": round(parts["reliability"], 4),
+        "brier_res": round(parts["resolution"], 4),
+        "brier_unc": round(parts["uncertainty"], 4),
+        "resolution_share": round(resolution_share(parts), 4),
         "nll": round(nll(proba, y_idx), 4),
         "aurc": round(aurc(confidence, correct), 4),
         "reliability": reliability_table(confidence, correct, bins),
@@ -144,11 +198,15 @@ def calibration_metrics(proba, labels, classes, bins=10):
 
 
 class Calibrator:
-    """A fitted, monotone rescaling of a student's probabilities. Serializes to JSON.
+    """A fitted rescaling of a student's probabilities. Serializes to JSON.
 
     `temperature` (one scalar), `platt` (two parameters on the log-odds, the right choice
     for a lopsided yes/no question) or `isotonic` (a step function, needs thousands of rows
-    and collapses on a few dozen).
+    and collapses on a few dozen). Opt-in for questions with more than two options:
+    `vector` (a scale and bias per option) or `matrix` (a full map between options), both
+    shrunk toward the identity. On the four pre-built panels `matrix` fit the teacher better
+    than the `auto` pick on every multi-option question and moved option rates toward the
+    teacher's, at the cost of a less calibrated top-option confidence (BENCHMARKS.md).
     """
 
     def __init__(self, method, params, n_fit=0, classes=None):
@@ -163,15 +221,18 @@ class Calibrator:
     def fit(cls, proba, labels, classes, method="auto", seed=0):
         """Fit on (probabilities, true labels). `method="auto"` picks by cross-validated
         log loss among temperature/platt/isotonic/none, which keeps a small or degenerate
-        calibration set from choosing a flexible method it cannot support."""
+        calibration set from choosing a flexible method it cannot support. `"auto-full"`
+        adds vector and matrix to that search (it tends to keep platt for yes/no questions
+        and pick matrix for the rest)."""
         proba = np.asarray(proba, dtype=float)
         y_idx = encode(labels, classes)
         keep = y_idx >= 0
         proba, y_idx = proba[keep], y_idx[keep]
         if len(y_idx) < 20 or len(np.unique(y_idx)) < 2:
             return cls("none", {}, n_fit=int(len(y_idx)), classes=list(classes))
-        if method == "auto":
-            method = cls._pick(proba, y_idx, classes, seed)
+        if method in ("auto", "auto-full"):
+            candidates = KNOWN_METHODS if method == "auto-full" else METHODS
+            method = cls._pick(proba, y_idx, classes, seed, candidates)
         params = cls._fit_params(method, proba, y_idx, len(classes))
         return cls(method, params, n_fit=int(len(y_idx)), classes=list(classes))
 
@@ -184,6 +245,10 @@ class Calibrator:
             return {}
         if method == "temperature":
             return {"temperature": _fit_temperature(_logits(proba), _onehot(y_idx, k))}
+        if method in FULL_METHODS:
+            W, b = _fit_linear_logits(_logits(proba), _onehot(y_idx, k), full=method == "matrix")
+            return {"W": [[round(float(v), 6) for v in row] for row in W],
+                    "b": [round(float(v), 6) for v in b]}
         binary = k == 2
         if binary:
             score, target = proba[:, 1], (y_idx == 1).astype(float)
@@ -200,10 +265,13 @@ class Calibrator:
                 "y": [round(float(v), 6) for v in iso.y_thresholds_],
                 "binary": binary,
             }
-        raise ValueError(f"unknown calibration method: {method!r} (expected one of {METHODS})")
+        raise ValueError(
+            f"unknown calibration method: {method!r} (expected 'auto', 'auto-full' or one of "
+            f"{KNOWN_METHODS})"
+        )
 
     @classmethod
-    def _pick(cls, proba, y_idx, classes, seed, n_splits=4):
+    def _pick(cls, proba, y_idx, classes, seed, candidates=METHODS, n_splits=4):
         """Cross-validated log loss over the calibration rows themselves."""
         n_splits = max(2, min(n_splits, int(np.bincount(y_idx).min()) if len(y_idx) else 2))
         try:
@@ -213,7 +281,7 @@ class Calibrator:
         except ValueError:
             return "temperature"
         scores = {}
-        for method in METHODS:
+        for method in candidates:
             total, ok = 0.0, True
             for train, test in folds:
                 try:
@@ -230,7 +298,7 @@ class Calibrator:
         best = min(scores, key=scores.get)
         # a tie goes to the simpler method: temperature generalizes off-distribution
         # better than isotonic and there is no reason to pay for flexibility you don't use
-        for method in METHODS:
+        for method in candidates:
             if method in scores and scores[method] <= scores[best] + 1e-4:
                 return method
         return best
@@ -244,6 +312,9 @@ class Calibrator:
             return proba / proba.sum(axis=1, keepdims=True)
         if self.method == "temperature":
             return _softmax(_logits(proba) / self.params["temperature"])
+        if self.method in FULL_METHODS:
+            W, b = np.asarray(self.params["W"]), np.asarray(self.params["b"])
+            return _softmax(_logits(proba) @ W.T + b)
         binary = bool(self.params.get("binary")) and proba.shape[1] == 2
         score = proba[:, 1] if binary else proba.max(axis=1)
         if self.method == "platt":
@@ -269,6 +340,11 @@ class Calibrator:
 
     @classmethod
     def from_dict(cls, blob):
+        if blob.get("method") not in KNOWN_METHODS:
+            raise ValueError(
+                f"unknown calibration method {blob.get('method')!r}; this artifact was "
+                "probably saved by a newer shrewd. Upgrade shrewd to load it."
+            )
         return cls(
             blob["method"], blob.get("params", {}), blob.get("n_fit", 0), blob.get("classes")
         )
@@ -310,6 +386,41 @@ def _fit_temperature(logits, onehot, bounds=(-3.0, 3.0)):
 
     result = minimize_scalar(objective, bounds=bounds, method="bounded")
     return round(float(np.exp(result.x)), 6)
+
+
+def _fit_linear_logits(logits, onehot, full=False, l2=1e-2):
+    """Log loss of softmax(z W^T + b), shrunk toward the identity map.
+
+    `full=False` is vector scaling (W diagonal: one scale and one bias per option), `full=True`
+    Dirichlet-style matrix scaling. Unlike temperature or a map on the top score, both move
+    each option's probability on its own, so a minority option the head under-states can be
+    raised without touching the others. The penalty keeps a rare option from fitting a
+    scale on a handful of rows.
+    """
+    n, k = logits.shape
+    eye = np.eye(k)
+
+    def unpack(theta):
+        if full:
+            return theta[: k * k].reshape(k, k), theta[k * k:]
+        return np.diag(theta[:k]), theta[k:]
+
+    def objective(theta):
+        W, b = unpack(theta)
+        z = logits @ W.T + b
+        z = z - z.max(axis=1, keepdims=True)
+        log_p = z - np.log(np.exp(z).sum(axis=1, keepdims=True))
+        loss = -np.mean((onehot * log_p).sum(axis=1))
+        loss += l2 * (((W - eye) ** 2).sum() + (b ** 2).sum())
+        g = (np.exp(log_p) - onehot) / n
+        dW = g.T @ logits + 2 * l2 * (W - eye)
+        db = g.sum(axis=0) + 2 * l2 * b
+        grad = dW.ravel() if full else np.diag(dW)
+        return loss, np.concatenate([grad, db])
+
+    start = np.concatenate([eye.ravel() if full else np.ones(k), np.zeros(k)])
+    result = minimize(objective, start, jac=True, method="L-BFGS-B")
+    return unpack(result.x)
 
 
 def _fit_platt(confidence, correct):

@@ -1,6 +1,7 @@
 """Compile one panel end to end and score it on its holdout.
 
     python examples/panels/build.py messages [--teacher ...] [--from-judged] [--features encoder]
+                                             [--calibration auto-full] [--run DIR]
 
 `--from-judged` reuses the teacher answers committed under judged/, so no API calls.
 Stages: add_seed -> judge -> distill -> holdout scores for the questions with public
@@ -31,6 +32,7 @@ ap.add_argument("panel", choices=sorted(PANELS))
 ap.add_argument("--teacher", default="anthropic/claude-fable-5-1")
 ap.add_argument("--features", default="auto")
 ap.add_argument("--no-stack", action="store_true")
+ap.add_argument("--calibration", default="auto", help='"auto", "auto-full" or one method')
 ap.add_argument("--concurrency", type=int, default=12)
 ap.add_argument("--from-judged", action="store_true",
                 help="reuse the teacher's committed answers from judged/; makes no API calls")
@@ -70,7 +72,7 @@ t0 = time.time()
 d.judge(pd.read_csv(data / "pool.csv"), concurrency=args.concurrency)
 print(f"judge stage took {time.time() - t0:.0f}s", flush=True)
 stack = not args.no_stack and args.features != "encoder"
-res = d.distill(features=args.features, zero_shot=stack)
+res = d.distill(features=args.features, zero_shot=stack, calibration=args.calibration)
 print(res.report(), flush=True)
 
 hold = with_gold(pd.read_csv(data / "holdout.csv"))
@@ -94,6 +96,7 @@ for key, q in spec["questions"].items():
 manifest = json.loads((run / "manifest.json").read_text())
 out["cost_usd"] = round(sum(s.get("cost_usd", 0) for s in manifest["stages"]), 2)
 out["features"] = args.features
+out["calibration"] = args.calibration
 (run / "holdout.json").write_text(json.dumps(out, indent=2))
 # keep every featurization's student and reports side by side for pick.py
 tag = args.features + ("+stack" if stack else "")

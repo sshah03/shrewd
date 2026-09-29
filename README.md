@@ -273,10 +273,13 @@ only ever answered by the teacher, and ship that way.
   `messages` and `pii` (encoder) are ~550 MB and `email` and `guardrail` are under 30 MB.
   `email` works with the plain install. `guardrail` needs `pip install "shrewd[embed]"`, and
   `messages` and `pii` need `pip install "shrewd[encoder]"`.
-- **Rebuild without a teacher.** `python examples/panels/build.py pii --from-judged`
-  retrains from Fable 5.1's answers, which are committed under `examples/panels/judged/`.
-  No API calls. It takes seconds for tf-idf or embeddings and ~25 min on a GPU for the
-  encoder.
+- **Rebuild without a teacher.** `python examples/panels/fetch.py pii` downloads the public
+  data (it needs `pip install huggingface_hub pyarrow`), then
+  `python examples/panels/build.py pii --from-judged` retrains from Fable 5.1's answers,
+  which are committed under `examples/panels/judged/`. No API calls. It takes seconds for
+  tf-idf or embeddings and ~25 min on a GPU for the encoder.
+  `python examples/panels/consistency.py` then checks whether a panel's answers agree with
+  each other (a phishing email should also be spam).
 - **Adapt one.** `python examples/panels/fetch.py` pulls the data,
   `python examples/panels/build.py pii` builds it (1,500 pool-judging calls plus seed
   evaluation), and `pick.py` chooses the featurization using the seed test split as a
@@ -311,6 +314,7 @@ only ever answered by the teacher, and ship that way.
 | `.judge(df, dry_run=False, concurrency=8)` | teacher answers every question per document in one call. writes `needs_review.csv` for its least confident answers |
 | `.apply_review()` | overrule the teacher wherever `human_answer` is filled in `needs_review.csv`. ledgered in `reviewed.csv` |
 | `.distill(features="auto", soft=True, calibration="auto", calibrate_teacher=False, zero_shot=False)` | train the heads on the teacher's distributions, calibrate them on the judged pool, score against your hand labels |
+| `calibration=` | `"auto"` (picks temperature, Platt, isotonic or none per question; never changes the winning option), `"auto-full"` (also tries vector and matrix scaling, which rescale every option and can change the winner; better on multi-option questions in [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md#full-vector-calibration)), or one method by name |
 | `features=` | `"auto"` (fits tf-idf and static embeddings on the pool, keeps whichever wins on the hand-labeled dev split), `"tfidf"`, `"embed"`, `"encoder"` (fine-tuned ModernBERT, `[encoder]`), a factory, or any transformer with `fit_transform`/`transform` |
 | `zero_shot=` | stack an off-the-shelf NLI model onto each head, kept per question only where it beats the plain head on the hand-labeled dev split (`[encoder]`) |
 | `load(dir_or_url)` | `.decide(texts)` -> typed answers, `.predict_proba(texts, calibrated=True)`. an `https://...tar.gz` URL is downloaded once to `~/.cache/shrewd/` |

@@ -25,7 +25,12 @@ from sklearn.metrics import f1_score
 from sklearn.model_selection import KFold
 
 from shrewd import decide
-from shrewd.calibrate import Calibrator, calibration_metrics
+from shrewd.calibrate import (
+    Calibrator,
+    brier_decomposition,
+    calibration_metrics,
+    resolution_share,
+)
 from shrewd.decide import NO, YES
 from shrewd.evaluate import Finding
 from shrewd.zeroshot import combine, fit_bias, fit_weights, hypotheses
@@ -35,6 +40,7 @@ MIN_MINORITY_ROWS = 12
 STACK_MARGIN = 0.02      # macro-F1 the stack must gain on gold dev to be kept
 REVIEW_FLOOR = 0.6       # a teacher answer below this lands in needs_review.csv
 MIN_GATE_ROWS = 40       # fewer gold dev rows than this and the gate abstains
+MIN_RESOLUTION_SHARE = 0.03  # below this a Choice or Score head is ~AUROC 0.6 on a balanced split
 
 
 # ---------------------------------------------------------------- gold answers
@@ -552,9 +558,15 @@ class DecisionStudent:
         student._features = features
         student.heads = blob["heads"]
         student.n_train_ = meta.get("n_train", 0)
-        student.calibrators = {
-            k: Calibrator.from_dict(v) for k, v in meta.get("calibration", {}).items()
-        }
+        try:
+            student.calibrators = {
+                k: Calibrator.from_dict(v) for k, v in meta.get("calibration", {}).items()
+            }
+        except ValueError as exc:
+            from shrewd import __version__
+
+            saved = (meta.get("versions") or {}).get("shrewd", "an unknown version")
+            raise ValueError(f"{exc} (saved with shrewd {saved}, this is {__version__})") from exc
         student.instructions = meta.get("instructions")
         student.stacks = meta.get("stacks", {}) or {}
         student.stack_report = meta.get("stack_report", {}) or {}
@@ -609,6 +621,11 @@ def question_metrics(question, proba, gold):
         truth = (gold == options.index(YES)).astype(float)
         out["base_rate"] = round(float(truth.mean()), 4)
         out["brier"] = round(float(np.mean((p_yes - truth) ** 2)), 4)
+        parts = brier_decomposition(p_yes, truth)
+        out["brier_rel"] = round(parts["reliability"], 4)
+        out["brier_res"] = round(parts["resolution"], 4)
+        out["brier_unc"] = round(parts["uncertainty"], 4)
+        out["resolution_share"] = round(resolution_share(parts), 4)
         out["auroc"] = _auroc(p_yes, truth)
         out["mean_p_yes"] = round(float(p_yes.mean()), 4)
     elif question.kind == "score":
@@ -648,7 +665,8 @@ class DecisionResult:
             f"trained on {m['n_train']} documents · scored on the locked test set "
             f"({m['n_test']} documents)",
             "",
-            f"{'question':{width}} {'type':7} {'':>7} {'ECE':>7} {'Brier':>7} {'acc':>7}",
+            f"{'question':{width}} {'type':7} {'':>7} {'ECE':>7} {'Brier':>7} {'resol':>7} "
+            f"{'acc':>7}",
         ]
         for key in keys:
             q = m["questions"][key]
@@ -660,7 +678,7 @@ class DecisionResult:
                 name = key if who == "teacher" else ""
                 lines.append(
                     f"{name:{width}} {s['type']:7} {who[:7]:>7} "
-                    f"{s['ece']:>7.3f} {s['brier']:>7.3f} {headline:>7}"
+                    f"{s['ece']:>7.3f} {s['brier']:>7.3f} {_share(s):>7} {headline:>7}"
                 )
         if m.get("uncalibrated"):
             lines += [
@@ -697,6 +715,11 @@ class DecisionResult:
                 lines.append(f"{' ' * 7}{f.detail}")
                 lines.append(f"{' ' * 7}→ {f.suggestion}")
         return "\n".join(lines)
+
+
+def _share(stats):
+    share = stats.get("resolution_share")
+    return "  n/a" if share is None or share != share else f"{share:.3f}"  # NaN check
 
 
 def _headline(stats):
@@ -746,6 +769,25 @@ def decision_findings(metrics):
                 "this question may not be answerable from the text alone, or the teacher "
                 "may be answering it inconsistently; check the teacher's own AUROC for it "
                 "before spending more on labels.",
+            ))
+            continue
+        share = student.get("resolution_share")
+        if (student.get("type") != "noul" and share is not None and share == share
+                and share < MIN_RESOLUTION_SHARE):
+            # the multi-option version of the AUROC check above. Yes/no questions keep
+            # AUROC because the share shrinks with the base rate at a fixed ranking quality.
+            # A warning, not a fail: the threshold comes from a simulation and hasn't been
+            # checked against a multi-option question with human labels yet
+            findings.append(Finding(
+                "warn",
+                f"{key}: calibrated but uninformative",
+                f"resolution is {share:.1%} of the uncertainty (Brier reliability "
+                f"{student['brier_rel']:.3f}, resolution {student['brier_res']:.3f}); the "
+                "head's probabilities barely move from the option base rates from one "
+                "document to the next. A low ECE here does not mean useful.",
+                "this question may not be answerable from the text alone, or the teacher "
+                "may be answering it inconsistently; compare the teacher's own resolution "
+                "for it before spending more on labels.",
             ))
             continue
         if student["ece"] > 0.10:
@@ -1054,6 +1096,11 @@ class Decisions:
         `calibrate_teacher=True` first calibrates the teacher's answers on the dev split and
         rescales the pool answers through it before training. Useful for rare questions where
         the teacher over-states. The locked test set is never used for this.
+
+        `calibration="auto-full"` lets questions with more than two options use a map that
+        moves every option (vector or matrix scaling), not only the top score. It fit the
+        teacher better on every multi-option question of the pre-built panels, but it can
+        change which option wins, so it's opt-in. `"auto"` is unchanged.
         """
         from shrewd.judge import judge_texts
 

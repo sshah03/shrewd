@@ -11,7 +11,9 @@ dataset, hides most labels to form an unlabeled pool, runs the pipeline, and sco
 teacher's bulk labels against the hidden gold. Its defaults are a starting point, not the
 exact setup of every run below. `examples/score_holdout.py <project_dir> <labeled csv>`
 scores a saved classifier. The panel fetch/build scripts and committed answers support
-panel rebuilds with `--from-judged`, and the README describes that workflow. Fresh teacher
+panel rebuilds with `--from-judged`, and the README describes that workflow.
+`examples/panels/calibration_study.py` and `examples/panels/description_prior.py` rerun the
+full-vector calibration and description-prior results on those rebuilds. Fresh teacher
 calls, changed data sources, and dependency versions can change results.
 
 ## How to read the tables
@@ -676,6 +678,106 @@ The panels showed three things the benchmark datasets hadn't:
   0.740 with character n-grams and 0.921 fine-tuned. Spotting names and birth dates takes
   context that character patterns miss.
 
+### Full-vector calibration
+
+`auto` calibration maps only the top option's probability on a multi-option question and
+spreads the rest in proportion, so the predicted option never changes. That can't fix a head
+that under-states one option relative to another, and it showed up as disagreement between
+questions. On `messages`, the calibrated P(unsolicited) averaged 12.1% against a gold rate
+of 12.2%, while P(kind is promotional or scam), which should be about the same number, fell
+to 8.4%. The yes/no heads were fine. The multi-option calibration was pulling the minority
+options down.
+
+`calibration="auto-full"` adds vector scaling (a scale and bias per option) and matrix
+scaling (a full map between options, shrunk toward the identity) to the `auto` search. On
+the four panels it picked matrix for all six multi-option questions and kept Platt for all
+thirteen yes/no questions, so the yes/no gold scores don't change.
+`python examples/panels/calibration_study.py` reproduces everything in this section from
+the committed teacher answers.
+
+Against the teacher, by nested 5-fold cross-validation on the judged pool:
+
+| question | log loss, auto → auto-full | option-rate error | top-option ECE | agrees with teacher | winner changes |
+|---|---|---|---|---|---|
+| messages `kind` | 0.156 → **0.125** | 0.019 → **0.003** | **0.008** → 0.023 | 0.936 → **0.961** | 3.5% |
+| messages `risk` | 0.258 → **0.195** | 0.020 → **0.004** | 0.019 → **0.016** | 0.911 → **0.933** | 4.3% |
+| email `intent` | 0.493 → **0.440** | 0.031 → **0.002** | **0.018** → 0.060 | 0.799 → **0.851** | 10.5% |
+| email `urgency` | 0.411 → **0.400** | 0.019 → **0.001** | 0.035 → **0.027** | 0.838 → **0.840** | 3.8% |
+| guardrail `handling` | 0.143 → **0.132** | 0.013 → **0.003** | **0.008** → 0.013 | 0.961 → **0.970** | 1.2% |
+| pii `share_risk` | 0.662 → **0.652** | 0.021 → **0.002** | **0.031** → 0.047 | 0.730 → **0.738** | 3.4% |
+
+No multi-option question has human labels, so the closest check against people is a
+multi-option answer that means the same thing as a yes/no gold question. For example,
+P(`kind` in {promotional, scam}) is scored against gold `unsolicited`. Holdout Brier for
+those, and the mean violation of the rules in `examples/panels/consistency.py`
+("a phishing email is spam"), with 95% intervals from a paired bootstrap that resamples
+both the pool rows the calibrators are fit on and the holdout rows:
+
+| panel | derived gold, auto-full − auto | consistency rules, auto-full − auto |
+|---|---|---|
+| messages | `unsolicited` −0.011 [−0.014, −0.009] | unsolicited ≈ promo/scam −0.014 [−0.019, −0.010], others within ±0.007 |
+| email | `spam` −0.045 [−0.054, −0.036] | "scam intent ⇒ spam" **+0.013 [+0.009, +0.016]**, others ≤ +0.001 |
+| guardrail | `harmful` −0.002 [−0.003, −0.001], `jailbreak` −0.004 [−0.006, −0.002] | harmful ⇒ refuse −0.013 [−0.018, −0.008], jailbreak ⇒ refuse −0.018 [−0.023, −0.012] |
+| pii | three proxies −0.018 to −0.034, each interval reaching 0 | +0.002 to +0.009, each interval reaching 0 |
+
+Negative is better. Matrix scaling fits the teacher better on every multi-option question
+and gets closer to gold where gold can be derived. It costs three things:
+
+- **The top option's stated confidence gets less calibrated** on four of the six questions,
+  noticeably on email `intent` (ECE 0.018 to 0.060).
+- **The predicted option can change**, on 1-10% of documents here. It agreed with the
+  teacher more often after the change on all six questions, but anything keyed to the old
+  winner will see different answers. That's why it's opt-in and `auto` is unchanged.
+- **It isn't always more consistent.** Raising the scam intents toward the teacher's rate
+  on email pushes them above the separately calibrated `spam` head more often, and on pii
+  the rules lean the wrong way (not significantly). Each question is still calibrated on
+  its own, so agreement between questions isn't guaranteed either way.
+
+On pii, `auto-full` doesn't always pick matrix when the pool is resampled, which is why
+its intervals reach zero. The pii proxies are loose anyway: `high` risk also covers
+identity numbers and device identifiers.
+
+In scripts not included here I also checked the edges: matrix scaling beat the `auto`
+pick on held-out log loss with only 150 or 300 calibration rows on all six questions,
+options with two or three rows in 1,500 kept their predicted rate within half a point, and
+a shrinkage of 1e-1 was worse everywhere. 1e-3 fit the teacher better than the default
+1e-2, but on derived gold it was closer on two panels and further on the other two, so the
+default stays at the more conservative 1e-2. Fitting the
+calibrator to the teacher's full distribution instead of its top answer didn't help
+(listed below). The encoder student hasn't been tested with `auto-full`.
+
+### Option descriptions as a prior
+
+The heads learn each question from the teacher's answers alone and never read the question.
+`examples/panels/description_prior.py` tests a head that also embeds each option's
+description and scores it against the document. It uses the same static embeddings as the
+`embed` student, plus a per-question head and a gate that keeps the description term for a
+question only where it beats the plain head by more than 0.01 AUROC on gold dev. Gold
+holdout AUROC, mean over each panel's gold questions, 5 random subsamples of the pool per
+size:
+
+| pool rows | messages | email | guardrail | pii |
+|---|---|---|---|---|
+| 100 | 0.985 → 0.985 | 0.948 → 0.948 | 0.837 → **0.906** | 0.809 → **0.818** |
+| 300 | 0.991 → 0.991 | 0.973 → 0.973 | 0.872 → **0.905** | 0.838 → 0.840 |
+| 1,200 | 0.995 → 0.995 | 0.981 → 0.981 | 0.911 → 0.913 | 0.865 → 0.865 |
+
+Plain → gated. The gain is almost all on rare questions whose description says something
+the embedding can pick up. Guardrail `harmful` (5.8% of the holdout) goes from 0.642 to
+0.788 at 100 rows, `jailbreak` from 0.900 to 0.957, and pii `credentials` from 0.837 to
+0.869. By 1,200 rows the plain head has caught up. Across the 12 panel-and-size cells the
+gate made no question worse by more than 0.01. With the gold dev split cut to 50 or 100
+rows, as a small project would have, the gate made 2 per-question losses over 0.01 against
+55 gains, and the guardrail gain shrank (`harmful` 0.736 at 100 rows with 50 dev rows).
+
+One detail matters for anyone trying this: static embeddings can't represent negation.
+"Not the case: this is spam" embeds almost on top of "this is spam", so a yes-minus-no
+score cancels the signal, and the descriptions alone scored 0.51 on messages. Giving only
+"yes" a key and "no" just a bias raised that to 0.82.
+
+This is a research script, not an option in `distill()`. It helped a lot on one panel, a
+little on another and not at all on two. I'd like to see it on other data first.
+
 ### What does not work
 
 - **`votes=3` on a decision panel.** It was already a weak signal for classification
@@ -689,7 +791,16 @@ The panels showed three things the benchmark datasets hadn't:
   up near-perfectly calibrated and near-useless, AUROC 0.505 and 0.469. The head
   answers the base rate on every comment. They're the two most contested questions in
   the set, where the crowd raters themselves disagree 17-23% of the time. `distill()`
-  reports this as a `fail` finding rather than as a good ECE.
+  reports this as a `fail` finding rather than as a good ECE. The report also splits
+  Brier into reliability, resolution and uncertainty. A head like this has almost no
+  reliability error and almost no resolution, and the `resol` column (resolution as a
+  share of uncertainty) shows it for multi-option questions too, where there's no AUROC.
+  Compare that share across heads for the same question, not across questions: it
+  shrinks with the base rate even at a fixed AUROC.
+- **Calibrating to the teacher's full distribution.** Fitting the calibrator to the
+  teacher's probabilities instead of its top answer gave a worse Brier on 7 of the 10
+  yes/no gold questions (mean ECE 0.037 vs 0.031) and mixed results on the multi-option
+  ones.
 
 ## Compared to other tools
 
