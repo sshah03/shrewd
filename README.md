@@ -1,21 +1,68 @@
 # shrewd
 
-Turn LLM judgments into a small, fast, local text model for one fixed task.
+[![PyPI](https://img.shields.io/pypi/v/shrewd)](https://pypi.org/project/shrewd/)
+[![Python](https://img.shields.io/pypi/pyversions/shrewd)](https://pypi.org/project/shrewd/)
+[![CI](https://github.com/sshah03/shrewd/actions/workflows/ci.yml/badge.svg)](https://github.com/sshah03/shrewd/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/sshah03/shrewd/blob/main/LICENSE)
+
+Turn repeated LLM classification calls into a small, fast, local model for one fixed task.
+
+It builds either a basic **classifier** (one label per document) or a **decision panel** type
+of classifier (a fixed set of choices, yes/no probabilities, and ratings answered together).
+Both use an LLM as the teacher and produce a saved model that runs locally with no LLM in
+the loop, often in under a millisecond on a CPU. Decision panels can also send the
+documents they're unsure about back to the LLM, with a threshold set so that at most 2% of
+requests get a local answer the LLM would have disagreed with.
+
+It is useful when you repeatedly classify similar text, have a few hundred hand-labeled
+examples and a larger unlabeled pool, and care about inference cost, latency, or keeping
+text on your own hardware after training. The hand-labeled examples become a locked test
+set that scores the LLM and the local model side by side, so you can see where each one
+is actually wrong.
+
+```python
+import pandas as pd
+from shrewd import Decisions, Noul, Score, load
+
+d = Decisions("runs/tickets", teacher="anthropic/claude-fable-5-1", questions={
+    "angry":    Noul(instructions="Does the customer sound angry?"),
+    "severity": Score(instructions="How severe is this?",
+                      criteria=["cosmetic", "workaround exists", "blocking"]),
+})
+d.add_seed(pd.read_csv("labeled.csv"))       # a few hundred hand-labeled tickets
+d.optimize()                                 # optional: GEPA tunes the LLM's prompt on them
+d.judge(pd.read_csv("unlabeled.csv"))        # the LLM answers the rest, one call each
+print(d.distill(route_budget=0.02).report()) # train, calibrate, score against your labels
+
+dec = load("runs/tickets")
+dec.decide(tickets, fallback=d.ask)          # local where it's sure, the LLM for the rest
+```
+
+Here's part of the report from re-distilling the SMS demo panel that way. The teacher and
+the student are both scored against the human labels, and the routing line says what the
+threshold is worth (one run, one split):
+
+```
+question       type                ECE   Brier   resol  headline
+unsolicited    noul    teacher   0.027   0.004   0.801  1.000 AUROC
+               noul    student   0.002   0.009   0.801  0.999 AUROC
+
+routing: answer locally when every question's confidence is at least 0.942. At most 2%
+         of all requests get a local answer the teacher disagrees with (95% bound, set
+         on 450 held-out documents, 36.9% of them local). On the test set 36.0% are
+         local, and against 63 hand-labeled answers those are wrong 0.0% of the time
+         (the teacher 0.0% on the same documents).
+```
+
+For a sense of scale, sending 1M consumer complaints a year through the LLM I used would
+cost about $3,400, at about a second each. The tf-idf student took 0.35 ms on my laptop,
+in under 10MB.
 
 I built shrewd while making local models for another project. It started with a question:
 can GEPA prompt optimization get better labels from an LLM? Then, since Jev-style decisions
 have gotten popular recently, I wanted to see how far I could get toward them locally for a
 fixed set of questions. This repo contains the pipeline I used and what I measured along
-the way.
-
-It is useful when you repeatedly classify similar text, have a few hundred hand-labeled
-examples and a larger unlabeled pool, and care about inference cost, latency, or keeping
-text on your own hardware after training. It builds either a basic **classifier** (one label per
-document) or a **decision panel** type of classifier (a fixed set of choices, yes/no probabilities,
-and ratings answered together). Both use an LLM as the teacher and produce a saved model that runs
-locally with no LLM in the loop.
-
-Some findings may be useful even if you never use the library:
+the way. Some findings may be useful even if you never use the library:
 
 - Prompt optimization helped some teachers, but gains on the development split often
   disappeared on held-out data.
@@ -25,16 +72,23 @@ Some findings may be useful even if you never use the library:
   giving it more training data sometimes helped more.
 - Calibration helped the probabilities match human labels, but low calibration error
   sometimes hid a model that barely distinguished one example from another.
+- Reading a confidence threshold off the evaluation curve broke a 2% disagreement budget
+  in 3 to 8 of 10 runs. A threshold set with a statistical bound on held-out rows stayed
+  within it.
 
 I used established methods. Most experiments weren't repeated with different data splits
 and training seeds, so small score differences need more testing. I'm sharing the code
-to make trying this on your own task easier. [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md) has the
-measurements, limits, and alternatives.
+to make trying this on your own task easier, and I'd especially like to hear which
+findings hold up on other people's data.
 
-I'd especially like to hear which findings hold up on other people's data.
+**Part 1** covers using it, including four small demo panels you can load to check the
+results without training anything.
+**Part 2** covers the findings and their limits, with fuller tables in
+[BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md).
 
-Four prebuilt decision panels (SMS spam, email triage, an AI-input guardrail, and a
-personal-data gate) are available as demonstrations, with their known failures below.
+---
+
+# Part 1: Using it
 
 ```
 seed CSV (labeled)    ──▶ [1] split: dev / locked test set
@@ -44,14 +98,6 @@ pool CSV (text only)  ──▶ [3] the teacher labels or judges the pool
                           [5] train a small local student on the result
                           [6] score teacher and student on the locked test set
 ```
-
-**Part 1** covers using it. **Part 2** covers the findings and their limits, with fuller
-tables in [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md). The repo includes pipeline examples and panel
-rebuilds. Some research results came from private experiment scripts that aren't included.
-
----
-
-# Part 1: Using it
 
 ## Install
 
@@ -225,13 +271,13 @@ a ninth question reuses the eight you already paid for. Changing a question's te
 options throws away its cached answers. The compiled artifact answers exactly the questions it was
 compiled for.
 
-### Try a pre-built panel
+### Demo panels
 
-Four decision panels for software that runs on a phone or laptop and would rather not
-send text anywhere. Each one is a directory you load and call. I built them from public
-data with Fable 5.1 as the teacher and scored them on a separate holdout that played no
-part in training or prompt optimization. Only questions with public reference labels are
-scored.
+Four decision panels I built from public data, so you can load a model and check the
+results without training anything. They're demonstrations of what this path produces, not
+models to adopt as is, and two of them have gaps you'd hit quickly (below). I used Fable
+5.1 as the teacher and scored them on a separate holdout that played no part in training
+or prompt optimization. Only questions with public reference labels are scored.
 
 | panel | decides | questions with human labels | AUROC | ECE | ms/doc | student |
 |---|---|---|---|---|---|---|
@@ -268,9 +314,18 @@ fixed the dashed form (1.00), half fixed the spaced one (0.50), and made the unb
 worse (0.27), with the holdout score unchanged. More varied training examples might help,
 but I haven't found a reliable fix.
 
-These panels are examples of what this path produces, not models to adopt as is. Questions
-with no public human labels (`kind`, `risk`, `intent`, `handling`, `share_risk`, etc.) were
-only ever answered by the teacher, and ship that way.
+`guardrail`'s `harmful` labels come from lmsys/toxic-chat, where harmful mostly means
+sexual or abusive chat. Requests for dangerous instructions barely appear in its data, so
+it misses them: a pipe-bomb question scores 0.19 on `harmful` and a request to synthesize
+meth 0.04, and `handling` said `answer` for every harmful request I tried. Don't use it as
+a safety filter.
+
+`email` was trained on Enron-era mail from 2002, lowercased and tokenized, so modern
+phishing looks unfamiliar to it. A one-line "verify your account within 24 hours" message
+scores 0.44 on `phishing`, and `intent` calls it `legitimate_personal`.
+
+Questions with no public human labels (`kind`, `risk`, `intent`, `handling`, `share_risk`,
+etc.) were only ever answered by the teacher, and ship that way.
 
 - **Download.** The panels are attached to the
   [`panels-v1` release](https://github.com/sshah03/shrewd/releases/tag/panels-v1). `load()`
@@ -366,7 +421,8 @@ An optional real-API smoke test runs with `SHREWD_E2E=1 pytest tests/test_e2e.py
 Every score below is against labels that didn't come from the teacher: human annotations,
 issue tags, the product a consumer picked for their own complaint, and synthetic PII
 annotations. Each table says which rows were scored. [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md) has the
-fuller methods and tables, and says what you can and can't rerun from this repo.
+fuller methods and tables, and says what you can and can't rerun from this repo. Some
+results came from private experiment scripts that aren't included.
 
 ## What I tried
 

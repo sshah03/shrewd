@@ -831,8 +831,8 @@ reading it off the curve:
 - **It needs data.** With 200 judged documents (60 held out) nothing was answered locally
   on any panel. Even with no disagreements at all, it takes 150 documents to certify 2%.
 - **The local answers are also better against people.** Error on the locally answered
-  documents was between 40% (pii) and a sixteenth (messages) of the error on all
-  documents. jevstiller can't check this, because it only measures agreement with the
+  documents was between 40% (pii) and about a twentieth (messages, 0.07% against 1.65%)
+  of the error on all documents. jevstiller can't check this, because it only measures agreement with the
   teacher.
 - **pii barely routes.** Its questions are hard for tf-idf and it disagrees with the
   teacher on 65% of documents somewhere in the panel, so almost nothing clears the

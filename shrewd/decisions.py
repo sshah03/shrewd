@@ -14,6 +14,7 @@ the result is distilled into one featurization with a calibrated head per questi
 
 import json
 import shutil
+import textwrap
 import warnings
 from datetime import UTC
 from pathlib import Path
@@ -727,8 +728,10 @@ class DecisionResult:
             f"trained on {m['n_train']} documents · scored on the locked test set "
             f"({m['n_test']} documents)",
             "",
-            f"{'question':{width}} {'type':7} {'':>7} {'ECE':>7} {'Brier':>7} {'resol':>7} "
-            f"{'acc':>7}",
+            # the last column is a different metric per question type, so each value says
+            # which: accuracy (choice), AUROC (yes/no), mean absolute error (score)
+            f"{'question':{width}} {'type':7} {'':>7} {'ECE':>7} {'Brier':>7} {'resol':>7}  "
+            f"headline",
         ]
         for key in keys:
             q = m["questions"][key]
@@ -740,7 +743,7 @@ class DecisionResult:
                 name = key if who == "teacher" else ""
                 lines.append(
                     f"{name:{width}} {s['type']:7} {who[:7]:>7} "
-                    f"{s['ece']:>7.3f} {s['brier']:>7.3f} {_share(s):>7} {headline:>7}"
+                    f"{s['ece']:>7.3f} {s['brier']:>7.3f} {_share(s):>7}  {headline}"
                 )
         if m.get("uncalibrated"):
             lines += [
@@ -771,26 +774,22 @@ class DecisionResult:
         if routing:
             lines.append("")
             if routing.get("threshold") is None:
-                lines.append(
-                    f"routing: {routing['n']} held-out documents could not certify a "
-                    f"{routing['budget']:.0%} disagreement budget; nothing is answered locally"
-                )
+                text = (f"routing: {routing['n']} held-out documents could not certify a "
+                        f"{routing['budget']:.0%} disagreement budget, so nothing is answered "
+                        "locally")
             else:
-                lines.append(
-                    f"routing: answer locally when every question's confidence is at least "
-                    f"{routing['threshold']:.3f}. Local answers that disagree with the teacher: "
-                    f"at most {routing['budget']:.0%} of all requests ({1 - routing['delta']:.0%} "
-                    f"bound, set on {routing['n']} held-out documents, "
-                    f"{routing['coverage']:.1%} of them local)"
-                )
+                text = (f"routing: answer locally when every question's confidence is at least "
+                        f"{routing['threshold']:.3f}. At most {routing['budget']:.0%} of all "
+                        f"requests get a local answer the teacher disagrees with "
+                        f"({1 - routing['delta']:.0%} bound, set on {routing['n']} held-out "
+                        f"documents, {routing['coverage']:.1%} of them local).")
                 t = routing.get("test") or {}
                 if t.get("answers_checked"):
-                    lines.append(
-                        f"{'':9}on the test set: {t['coverage']:.1%} local; against human "
-                        f"labels those answers are wrong {t['student_error']:.1%} of the time, "
-                        f"the teacher {t['teacher_error']:.1%} on the same documents "
-                        f"({t['answers_checked']} hand-labeled answers)"
-                    )
+                    text += (f" On the test set {t['coverage']:.1%} are local, and against "
+                             f"{t['answers_checked']} hand-labeled answers those are wrong "
+                             f"{t['student_error']:.1%} of the time (the teacher "
+                             f"{t['teacher_error']:.1%} on the same documents).")
+            lines += textwrap.wrap(text, width=88, subsequent_indent=" " * 9)
         lines.append("")
         if not self.findings:
             lines.append("findings: none, nothing looks off")
@@ -810,11 +809,11 @@ def _share(stats):
 
 def _headline(stats):
     if stats["type"] == "score":
-        return f"{stats['mae']:.2f}mae"
+        return f"{stats['mae']:.2f} MAE"
     if stats["type"] == "noul":
         auroc = stats.get("auroc")
-        return "  n/a" if auroc != auroc else f"{auroc:.3f}"  # NaN check
-    return f"{stats['accuracy']:.3f}"
+        return "n/a AUROC" if auroc != auroc else f"{auroc:.3f} AUROC"  # NaN check
+    return f"{stats['accuracy']:.3f} acc"
 
 
 # ---------------------------------------------------------------- diagnosis

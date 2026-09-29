@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "shrewd"
 dynamic = ["version"]
-description = "Turn LLM judgments into a small, fast, local text model for one fixed task."
+description = "Turn repeated LLM classification calls into a small, fast, local model for one fixed task."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
