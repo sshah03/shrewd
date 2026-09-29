@@ -778,6 +778,81 @@ score cancels the signal, and the descriptions alone scored 0.51 on messages. Gi
 This is a research script, not an option in `distill()`. It helped a lot on one panel, a
 little on another and not at all on two. I'd like to see it on other data first.
 
+### Routing with a guarantee
+
+`distill(route_budget=0.02)` picks the confidence threshold for you, so that with 95%
+probability at most 2% of all requests are answered locally *and* disagree with the teacher.
+A document is routed as a whole, because one teacher call answers the whole panel, and it's
+only as sure as its least sure answer. The threshold comes from a fixed-sequence test: walk
+from the strictest threshold to the loosest, bound the disagreement at each with a
+Clopper-Pearson interval, and stop at the first that goes over. The idea is from
+[jevstiller](https://jevstiller.pages.dev), which does the same for a proxy in front of a
+hosted LLM. `python examples/panels/routing_study.py` reproduces
+everything here from the committed teacher answers.
+
+The threshold has to be set on documents the saved model never trained on, so
+`distill()` holds 30% of the judged pool out. The obvious shortcut is to use the
+out-of-fold scores that calibration already computes. It doesn't work: those come from
+five other models, each trained on less. On pii it went over budget (true risk 2.3%). On
+messages it said 27% of documents would be local and 36% were.
+
+Is the guarantee valid? One student per panel, fit on 900 judged documents. It scores the
+other 600, and 500 times a threshold set is drawn from them and the threshold is checked
+on the rest. A valid 95% guarantee goes over budget in at most 5% of draws:
+
+| panel | over budget, 150-doc threshold set | over budget, 300-doc set | local, 300-doc set |
+|---|---|---|---|
+| messages | 7.4% | 3.6% | 17.7% |
+| email | 4.6% | 1.6% | 25.8% |
+| guardrail | 4.8% | 4.4% | 52.8% |
+| pii | 3.6% | 2.6% | 3.6% |
+
+The 7.4% is about what you'd expect from checking on only 450 documents. It's close to
+the budget, and the check itself is noisy.
+
+The whole recipe at 1,000 judged documents, 10 random draws per panel. Coverage and
+disagreement are on the rest of the judged pool. Error is against human labels on the
+holdout, averaged over the gold questions, for the documents answered locally and for all
+of them. "Naive" is the loosest threshold whose observed disagreement is within 2%, i.e.
+reading it off the curve:
+
+| panel | local | disagreement | naive: local | naive: disagreement | naive over budget | gold error, local | gold error, all |
+|---|---|---|---|---|---|---|---|
+| messages | 23.1% | 0.64% | 47.8% | 2.08% | 5/10 | 0.1% | 1.6% |
+| email | 18.0% | 0.64% | 34.9% | 2.82% | 7/10 | 1.4% | 5.2% |
+| guardrail | 61.9% | 0.76% | 89.2% | 2.04% | 4/10 | 1.5% | 7.0% |
+| pii | 3.8% | 0.84% | 9.0% | 2.70% | 7/10 | 7.3% | 17.6% |
+
+- **Reading the threshold off the curve breaks the budget most of the time.** That's the
+  number the README used to tell you to pick by eye.
+- **The guarantee is conservative.** Actual disagreement was a third to two fifths of the
+  budget, and coverage was 40-70% of the naive threshold's. With a few hundred documents
+  the bound can only certify thresholds where the student almost never disagrees.
+- **It needs data.** With 200 judged documents (60 held out) nothing was answered locally
+  on any panel. Even with no disagreements at all, it takes 150 documents to certify 2%.
+- **The local answers are also better against people.** Error on the locally answered
+  documents was between 40% (pii) and a sixteenth (messages) of the error on all
+  documents. jevstiller can't check this, because it only measures agreement with the
+  teacher.
+- **pii barely routes.** Its questions are hard for tf-idf and it disagrees with the
+  teacher on 65% of documents somewhere in the panel, so almost nothing clears the
+  threshold. That's the right answer for it.
+
+The guaranteed threshold went over budget in 0-2 of these 10 draws at each size (200, 500
+and 1,000 judged). That's measured on the 500-1,300 judged documents left over, so the
+count is noisy. The validity table above is the real test.
+
+The real `distill(route_budget=0.02)` on the full messages pool (1,375 training documents,
+450 held out) answered 36.9% of held-out and 36.0% of test documents locally. None of the
+63 local test answers to the one hand-labeled question, `unsolicited`, was wrong.
+
+The guarantee is for traffic like the judged pool. In a script not included here I also
+simulated drift: one question's "yes" documents made 3x as common, and a student trained
+on the shorter 60% of documents facing only the longer 40%. Neither pushed disagreement
+over budget on any panel, so a random audit sample (jevstiller audits 2%) had nothing to
+catch. I'm not adding an audit helper until I see drift that breaks the guarantee.
+Re-judging a sample of recent traffic and re-distilling does the same job.
+
 ### What does not work
 
 - **`votes=3` on a decision panel.** It was already a weak signal for classification

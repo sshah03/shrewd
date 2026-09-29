@@ -858,3 +858,68 @@ def test_loading_a_model_without_its_extra_names_the_install(monkeypatch):
     with pytest.raises(ImportError, match=r'pip install "shrewd\[embed\]"'):
         decisions._check_extra("embed")
     decisions._check_extra("tfidf")  # needs nothing extra
+
+
+def _routed_panel(tmp_path, budget):
+    docs = make_docs(400)
+    d = Decisions(tmp_path / "panel", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[:120], test_frac=0.4)
+    d.judge(docs.iloc[120:][["text"]])
+    return d, d.distill(features="tfidf", route_budget=budget)
+
+
+def test_routing_threshold_is_set_on_documents_the_model_never_saw(tmp_path, decision_teacher):
+    d, result = _routed_panel(tmp_path, budget=0.9)
+    routing = result.metrics["routing"]
+    # 30% of the 280 judged documents are held out; the rest plus 72 dev rows train
+    assert routing["n"] == 84 and result.metrics["n_train"] == 196 + 72
+    assert routing["threshold"] is not None and routing["bound"] <= 0.9
+    assert routing["test"]["n_local"] > 0
+    assert "routing: answer locally" in result.report()
+
+    from shrewd import load
+
+    loaded = load(tmp_path / "panel")
+    assert loaded.routing["threshold"] == routing["threshold"]
+    texts = ["ticket 1: the refund problem again", "ticket 2: the crash problem again"] * 20
+    local = loaded.local(texts)
+    routed = loaded.decide(texts, route=True)
+    plain = loaded.decide(texts)
+    for ok, r, p in zip(local, routed, plain, strict=True):
+        assert (r is None) == (not ok)
+        if ok:
+            assert {k: a.payload for k, a in r.items()} == {k: a.payload for k, a in p.items()}
+
+
+def test_fallback_answers_what_the_student_does_not(tmp_path, decision_teacher):
+    d, _ = _routed_panel(tmp_path, budget=0.9)
+    student = __import__("shrewd").load(tmp_path / "panel")
+    student.routing["threshold"] = 2.0          # nothing clears it: everything falls back
+    texts = ["ticket 1: the refund problem again", "ticket 2: the crash problem again"]
+    rows = student.decide(texts, fallback=d.ask)
+    assert rows == d.ask(texts)
+    assert set(rows[0]) == set(QUESTIONS)
+    single = student.decide(texts[0], fallback=d.ask)
+    assert single["department"].choice == rows[0]["department"].choice
+    with pytest.raises(ValueError, match="fallback returned"):
+        student.decide(texts, fallback=lambda ts: [])
+
+
+def test_a_budget_too_tight_for_the_data_answers_nothing_locally(tmp_path, decision_teacher):
+    _, result = _routed_panel(tmp_path, budget=0.001)
+    assert result.metrics["routing"]["threshold"] is None
+    assert "could not certify" in result.report()
+    loaded = __import__("shrewd").load(tmp_path / "panel")
+    assert loaded.decide(["ticket 1: the refund problem again"], route=True) == [None]
+
+
+def test_routing_without_a_threshold_says_how_to_get_one(tmp_path, decision_teacher):
+    docs = make_docs(240)
+    d = Decisions(tmp_path / "panel", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[:120], test_frac=0.4)
+    d.judge(docs.iloc[120:][["text"]])
+    d.distill(features="tfidf")
+    loaded = __import__("shrewd").load(tmp_path / "panel")
+    assert loaded.routing is None
+    with pytest.raises(ValueError, match="route_budget"):
+        loaded.decide(["ticket 1"], route=True)

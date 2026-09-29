@@ -249,6 +249,7 @@ class DecisionStudent:
         self.stacks = {}           # question id -> {"bias", "weights"} for kept stacks
         self.stack_report = {}     # question id -> the gate's decision, kept or not
         self._pool_cache = None    # (texts, oof, zs) from stack(), reused by calibrate()
+        self.routing = None        # threshold and its guarantee, from set_routing()
         self.n_train_ = 0
 
     # -- training --------------------------------------------------------------
@@ -480,17 +481,76 @@ class DecisionStudent:
             out[key] = proba
         return out
 
-    def decide(self, texts, calibrated=True, questions=None):
-        """Typed answers. A single string in gives a single answer map back."""
+    def decide(self, texts, calibrated=True, questions=None, route=False, fallback=None):
+        """Typed answers. A single string in gives a single answer map back.
+
+        `route=True` answers only the documents that clear the routing threshold set by
+        `distill(route_budget=...)` and gives None for the rest. `fallback` (a callable taking
+        a list of texts and returning one answer map per text, such as `Decisions.ask`)
+        answers the rest instead, and implies `route=True`.
+        """
         single = isinstance(texts, str)
+        texts = [texts] if single else list(texts)
         keys = self._select(questions)
-        proba = self.predict_proba(texts, calibrated=calibrated, questions=keys)
-        n = 1 if single else len(list(texts))
-        rows = [
-            {key: decide.make_answer(key, self.questions[key], proba[key][i]) for key in keys}
-            for i in range(n)
-        ]
+        route = route or fallback is not None
+        if route:
+            local = self.local(texts)
+            kept = [t for t, ok in zip(texts, local, strict=True) if ok]
+            proba = (self.predict_proba(kept, calibrated=calibrated, questions=keys)
+                     if kept else {})
+        else:
+            local = np.ones(len(texts), dtype=bool)
+            proba = self.predict_proba(texts, calibrated=calibrated, questions=keys)
+        rows = [None] * len(texts)
+        for i, row in enumerate(np.where(local)[0]):
+            rows[row] = {key: decide.make_answer(key, self.questions[key], proba[key][i])
+                         for key in keys}
+        if fallback is not None and not local.all():
+            rest = [t for t, ok in zip(texts, local, strict=True) if not ok]
+            answers = list(fallback(rest))
+            if len(answers) != len(rest):
+                raise ValueError(f"fallback returned {len(answers)} answers for {len(rest)} texts")
+            answers = iter(answers)
+            rows = [row if row is not None else next(answers) for row in rows]
         return rows[0] if single else rows
+
+    # -- routing ---------------------------------------------------------------
+
+    def routing_scores(self, texts, calibrated=True):
+        """Each document's lowest top probability over the questions the threshold covers."""
+        from shrewd.route import doc_scores
+
+        keys = self.routing["questions"] if self.routing else list(self.heads)
+        return doc_scores(self.predict_proba(texts, calibrated=calibrated, questions=keys))
+
+    def local(self, texts):
+        """True for the documents this model answers itself under its routing guarantee."""
+        if not self.routing:
+            raise ValueError(
+                "this model has no routing threshold; distill with route_budget= (for "
+                "example 0.02) to set one with a guarantee"
+            )
+        texts = [texts] if isinstance(texts, str) else list(texts)
+        threshold = self.routing["threshold"]
+        if threshold is None:
+            return np.zeros(len(texts), dtype=bool)
+        return self.routing_scores(texts) >= threshold
+
+    def set_routing(self, texts, targets, budget=0.02, delta=0.05):
+        """Set the threshold on documents this model never trained on, judged by the teacher.
+
+        The guarantee: with probability 1 - delta over these documents, the share of requests
+        like them that are answered locally *and* disagree with the teacher is at most
+        `budget`. It is a share of all requests, not of the locally answered ones.
+        """
+        from shrewd.route import doc_disagree, doc_scores, pick_threshold
+
+        keys = [k for k in self.heads if k in targets]
+        proba = self.predict_proba(list(texts), questions=keys)
+        _, stats = pick_threshold(doc_scores(proba), doc_disagree(proba, targets, keys),
+                                  budget, delta)
+        self.routing = {**stats, "questions": keys}
+        return self
 
     # -- persistence -----------------------------------------------------------
 
@@ -523,6 +583,7 @@ class DecisionStudent:
                     "features_saved_separately": saved_separately,
                     "stacks": self.stacks,
                     "stack_report": self.stack_report,
+                    "routing": self.routing,
                     "zero_shot": (self.zero_shot.to_dict()
                                   if self.zero_shot is not None and self.stacks else None),
                     "versions": {"shrewd": __version__, "scikit-learn": sklearn.__version__},
@@ -570,6 +631,7 @@ class DecisionStudent:
         student.instructions = meta.get("instructions")
         student.stacks = meta.get("stacks", {}) or {}
         student.stack_report = meta.get("stack_report", {}) or {}
+        student.routing = meta.get("routing")
         if student.stacks and meta.get("zero_shot"):
             from shrewd.zeroshot import ZeroShotScorer
 
@@ -705,6 +767,30 @@ class DecisionResult:
                     f"{key:{width}}  {verdict:8} {metric} {s['dev_gain']:+.3f} on {s['dev_n']} "
                     f"dev rows  weights head {w[0]:+.2f} zero-shot {w[1]:+.2f}"
                 )
+        routing = m.get("routing")
+        if routing:
+            lines.append("")
+            if routing.get("threshold") is None:
+                lines.append(
+                    f"routing: {routing['n']} held-out documents could not certify a "
+                    f"{routing['budget']:.0%} disagreement budget; nothing is answered locally"
+                )
+            else:
+                lines.append(
+                    f"routing: answer locally when every question's confidence is at least "
+                    f"{routing['threshold']:.3f}. Local answers that disagree with the teacher: "
+                    f"at most {routing['budget']:.0%} of all requests ({1 - routing['delta']:.0%} "
+                    f"bound, set on {routing['n']} held-out documents, "
+                    f"{routing['coverage']:.1%} of them local)"
+                )
+                t = routing.get("test") or {}
+                if t.get("answers_checked"):
+                    lines.append(
+                        f"{'':9}on the test set: {t['coverage']:.1%} local; against human "
+                        f"labels those answers are wrong {t['student_error']:.1%} of the time, "
+                        f"the teacher {t['teacher_error']:.1%} on the same documents "
+                        f"({t['answers_checked']} hand-labeled answers)"
+                    )
         lines.append("")
         if not self.findings:
             lines.append("findings: none, nothing looks off")
@@ -1086,7 +1172,8 @@ class Decisions:
         return frame
 
     def distill(self, features="auto", soft=True, calibration="auto",
-                calibrate_teacher=False, zero_shot=False, stack_margin=STACK_MARGIN):
+                calibrate_teacher=False, zero_shot=False, stack_margin=STACK_MARGIN,
+                route_budget=None, route_delta=0.05, route_frac=0.3):
         """Train the heads on the judged pool, calibrate them, and score against gold.
 
         `zero_shot=True` (or a `ZeroShotScorer`) stacks an NLI model onto each head and keeps
@@ -1101,6 +1188,14 @@ class Decisions:
         moves every option (vector or matrix scaling), not only the top score. It fit the
         teacher better on every multi-option question of the pre-built panels, but it can
         change which option wins, so it's opt-in. `"auto"` is unchanged.
+
+        `route_budget=0.02` holds `route_frac` of the judged pool out of training and sets a
+        routing threshold on it with the saved model: with probability 1 - `route_delta`, at
+        most 2% of requests like the pool are answered locally and disagree with the teacher.
+        Then `decide(texts, route=True)` or `decide(texts, fallback=d.ask)` uses it. The
+        student trains on less, and a few hundred held-out documents certify little, so
+        this pays off from about a thousand judged documents. The report also checks the
+        locally answered test documents against the human labels.
         """
         from shrewd.judge import judge_texts
 
@@ -1117,6 +1212,20 @@ class Decisions:
         pool["text"] = pool["text"].astype(str)
 
         pool_targets = self._targets_from_pool(pool)
+        route_pool = None
+        if route_budget is not None:
+            # the threshold must be set on documents the saved model never saw: out-of-fold
+            # scores come from other models, and in testing they broke the budget far more
+            # often than delta allows
+            order = np.random.default_rng(self.seed).permutation(len(pool))
+            held = np.sort(order[: int(round(route_frac * len(pool)))])
+            kept = np.sort(order[int(round(route_frac * len(pool))):])
+            route_pool = (pool["text"].iloc[held].tolist(),
+                          {key: v[held] for key, v in pool_targets.items()})
+            pool = pool.iloc[kept].reset_index(drop=True)
+            pool_targets = {key: v[kept] for key, v in pool_targets.items()}
+            print(f"holding {len(held)} judged documents out of training to set the routing "
+                  f"threshold (budget {route_budget:.1%}, {1 - route_delta:.0%} guarantee)")
         dev_gold = gold_frame(dev, self.questions)
         dev_targets = self._targets_from_gold(dev_gold)
         teacher_cost = 0.0
@@ -1154,6 +1263,8 @@ class Decisions:
                   + (f": {', '.join(kept)}" if kept else ""))
         print(f"calibrating on {len(pool)} judged documents (cross-fit, no API calls)")
         student.calibrate(pool["text"].tolist(), pool_targets, method=calibration)
+        if route_pool is not None:
+            student.set_routing(*route_pool, budget=route_budget, delta=route_delta)
         shutil.rmtree(self.dir / "student", ignore_errors=True)
         student.save(self.dir / "student")
 
@@ -1192,12 +1303,70 @@ class Decisions:
             metrics["teacher_calibration"] = {k: c.to_dict() for k, c in teacher_cals.items()}
         if student.stack_report:
             metrics["stacking"] = student.stack_report
+        if student.routing:
+            metrics["routing"] = self._routing_check(student, test, teacher_frame)
         findings = decision_findings(metrics)
         (self.dir / "report.json").write_text(json.dumps(metrics, indent=2))
         self._record_stage("distill", cost + teacher_cost, features=student.features_kind,
                            soft=soft, calibrate_teacher=calibrate_teacher,
                            zero_shot=bool(zero_shot))
         return DecisionResult(metrics, findings)
+
+    def _routing_check(self, student, test, teacher_frame):
+        """The threshold's guarantee, plus what it means against human labels: on the locked
+        test set, the error of the answers the student keeps and of the teacher on the same
+        documents, pooled over every answered question."""
+        routing = dict(student.routing)
+        gold = gold_frame(test, self.questions)
+        local = student.local(test["text"].tolist())
+        proba = student.predict_proba(test["text"].tolist())
+        teacher = teacher_frame.set_index("text").reindex(test["text"])
+        wrong = {"student": 0, "teacher": 0}
+        answered = 0
+        for j, (key, question) in enumerate(self.questions.items()):
+            if key not in proba:
+                continue
+            columns = [f"{key}__{o}" for o in question.options()]
+            values = teacher[columns].to_numpy(dtype=float)
+            usable = local & (gold[:, j] >= 0) & ~np.isnan(values).any(axis=1)
+            answered += int(usable.sum())
+            wrong["student"] += int((proba[key].argmax(axis=1) != gold[:, j])[usable].sum())
+            wrong["teacher"] += int((np.nan_to_num(values).argmax(axis=1)
+                                     != gold[:, j])[usable].sum())
+        routing["test"] = {
+            "coverage": round(float(local.mean()), 4) if len(local) else 0.0,
+            "n_local": int(local.sum()),
+            "answers_checked": answered,
+            "student_error": round(wrong["student"] / answered, 4) if answered else None,
+            "teacher_error": round(wrong["teacher"] / answered, 4) if answered else None,
+        }
+        return routing
+
+    def ask(self, texts):
+        """The teacher's answers, as answer maps in the same shape as `decide()` gives. Pass it
+        as `decide(texts, fallback=d.ask)` to send what the student is unsure of to the
+        teacher. Answers are cached like `judge()`'s."""
+        from shrewd.judge import judge_texts
+
+        single = isinstance(texts, str)
+        texts = [texts] if single else list(texts)
+        frame, _ = judge_texts(
+            texts, self.questions, self.teacher, instructions=self.instructions,
+            backend=self.backend, conn=self._cache(), desc="teacher fallback",
+            header=self._header(),
+        )
+        frame = frame.set_index("text").reindex(texts)
+        rows = []
+        for i in range(len(texts)):
+            row = {}
+            for key, question in self.questions.items():
+                values = frame.iloc[i][[f"{key}__{o}" for o in question.options()]]
+                values = values.to_numpy(dtype=float)
+                if np.isnan(values).any():
+                    continue            # the teacher's answer could not be read
+                row[key] = decide.make_answer(key, question, values / values.sum())
+            rows.append(row)
+        return rows[0] if single else rows
 
     def _pick_features(self, pool_texts, pool_targets, dev_texts, dev_gold, soft):
         """tf-idf or static embeddings: fit each on the pool alone, score on gold dev, keep

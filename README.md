@@ -211,6 +211,11 @@ Options:
   each head and keeps it per question only where it beats the plain head on your hand-labeled
   dev split. It helped on sentiment and emotion and got rejected almost everywhere else.
   20-800 ms/doc.
+- **Send the unsure ones to the teacher.** `distill(route_budget=0.02)` picks a confidence
+  threshold so that at most 2% of requests get a local answer the teacher would disagree
+  with. Then `dec.decide(texts, fallback=d.ask)` answers the rest with the teacher, or
+  `route=True` leaves them as `None`. It needs about a thousand judged documents to be
+  worth it. Part 2 has the numbers.
 - **Use several teachers.** `backend=EnsembleBackend(["anthropic/claude-fable-5-1",
   "openai/gpt-6-astra"])` averages their distributions. `backend="logprobs"` reads token
   probabilities where the API exposes them (OpenAI-compatible endpoints).
@@ -316,8 +321,10 @@ only ever answered by the teacher, and ship that way.
 | `.distill(features="auto", soft=True, calibration="auto", calibrate_teacher=False, zero_shot=False)` | train the heads on the teacher's distributions, calibrate them on the judged pool, score against your hand labels |
 | `calibration=` | `"auto"` (picks temperature, Platt, isotonic or none per question; never changes the winning option), `"auto-full"` (also tries vector and matrix scaling, which rescale every option and can change the winner; better on multi-option questions in [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md#full-vector-calibration)), or one method by name |
 | `features=` | `"auto"` (fits tf-idf and static embeddings on the pool, keeps whichever wins on the hand-labeled dev split), `"tfidf"`, `"embed"`, `"encoder"` (fine-tuned ModernBERT, `[encoder]`), a factory, or any transformer with `fit_transform`/`transform` |
+| `route_budget=` | hold `route_frac=0.3` of the pool out and set a routing threshold on it: with probability `1 - route_delta` (default 95%), at most this share of all requests is answered locally and disagrees with the teacher. Off by default |
 | `zero_shot=` | stack an off-the-shelf NLI model onto each head, kept per question only where it beats the plain head on the hand-labeled dev split (`[encoder]`) |
-| `load(dir_or_url)` | `.decide(texts)` -> typed answers, `.predict_proba(texts, calibrated=True)`. an `https://...tar.gz` URL is downloaded once to `~/.cache/shrewd/` |
+| `.ask(texts)` | the teacher's answers in the same shape as `decide()`, cached like `judge()`'s. Pass it as `fallback=` |
+| `load(dir_or_url)` | `.decide(texts, route=False, fallback=None)` -> typed answers, `.local(texts)` -> which clear the routing threshold, `.predict_proba(texts, calibrated=True)`. an `https://...tar.gz` URL is downloaded once to `~/.cache/shrewd/` |
 
 Backends: `"verbalized"` (default, works everywhere), `"logprobs"` (OpenAI-compatible
 endpoints only), or `EnsembleBackend([...])` to average several teachers.
@@ -428,7 +435,8 @@ threshold for each coverage level, and `clf.predict(texts, min_confidence=0.52)`
 `None` below it so you can send those rows to the teacher or a person. I read these
 thresholds off the evaluation data. For real use, pick the threshold on validation data,
 then check both models on the rows you keep, and the whole setup with its fallback on a
-fresh holdout.
+fresh holdout. Decision panels can now do this for you, with a guarantee; see
+[Routing with a guarantee](https://github.com/sshah03/shrewd#routing-with-a-guarantee).
 
 If you already run an LLM classifier in production and want to keep the LLM as a fallback,
 look at [TRACER](https://github.com/adrida/tracer). There's a comparison with it and with
@@ -536,6 +544,21 @@ identical outputs across repeated calls, save and load, batch sizes, and input o
 Nothing is sampled and no hosted model changes under you. Encoder results can differ very
 slightly across hardware or batch sizes. The tf-idf/embedding panel answered 4,000
 documents x 8 questions in 130 ms on one core, about 246,000 answers a second.
+
+### Routing with a guarantee
+
+Reading a threshold off the confidence curve looks fine and isn't. At 1,000 judged
+documents, the loosest threshold whose observed disagreement with the teacher was under 2%
+went over 2% on new documents in 4 to 7 of 10 draws on every panel. `route_budget=0.02`
+picks the threshold with a statistical bound instead, set on documents the saved model
+never trained on, and in 500 redraws per panel it went over budget about as rarely as a
+95% guarantee promises (1.6-7.4% of draws). It's conservative: it answered 4-62% of
+documents locally, 40-70% of what the naive threshold did. Those local answers were also
+much better against human labels: 1.5% wrong on guardrail against 7.0% overall, 1.4%
+against 5.2% on email. The idea is from [jevstiller](https://jevstiller.pages.dev), which
+only measures agreement with the teacher.
+[BENCHMARKS](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md#routing-with-a-guarantee)
+has the tables and what didn't work.
 
 ### What didn't work
 
