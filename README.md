@@ -38,9 +38,12 @@ dec = load("runs/tickets")
 dec.decide(tickets, fallback=d.ask)          # local where it's sure, the LLM for the rest
 ```
 
-Here's part of the report from re-distilling the SMS demo panel that way. The teacher and
-the student are both scored against the human labels, and the routing line says what the
-threshold is worth (one run, one split):
+To see it run without an API key,
+[open the quickstart in Colab](https://colab.research.google.com/github/sshah03/shrewd/blob/main/examples/quickstart.ipynb).
+It runs this workflow on the SMS demo data from the teacher's cached answers, in a couple
+of minutes. Here's part of the report it prints. The teacher and the student are both
+scored against the human labels, and the routing line says what the threshold is worth
+(one run, one split):
 
 ```
 question       type                ECE   Brier   resol  headline

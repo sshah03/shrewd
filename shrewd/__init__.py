@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from shrewd.project import Project as Project
     from shrewd.students import load as load
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "Choice", "Decisions", "DistillResult", "Finding", "Noul", "Project", "Score",
