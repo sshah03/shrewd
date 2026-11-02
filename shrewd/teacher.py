@@ -204,12 +204,9 @@ def classify(text, prompt, model, labels, temperature=0.0, conn=None, vote_index
     return parse_label(content, labels), cost + retry_cost
 
 
-def label_texts(texts, prompt, model, labels, votes=1, conn=None, concurrency=8, desc="labeling"):
-    """Label many texts concurrently, aggregating votes.
-
-    Returns (DataFrame[text, label, confidence], total_cost_usd). Unresolvable items
-    get the INVALID label and confidence 0.0.
-    """
+def cast_ballots(texts, prompt, model, labels, votes=1, conn=None, concurrency=8,
+                 desc="labeling"):
+    """Every vote for every distinct text. Returns (unique_texts, ballots, total_cost_usd)."""
     temperature = _temperature(votes)
     unique = list(dict.fromkeys(texts))  # duplicates get one set of calls and one verdict
     ballots = [[None] * votes for _ in unique]
@@ -230,7 +227,18 @@ def label_texts(texts, prompt, model, labels, votes=1, conn=None, concurrency=8,
             for future in futures:
                 future.cancel()
             raise
+    return unique, ballots, total_cost
 
+
+def label_texts(texts, prompt, model, labels, votes=1, conn=None, concurrency=8, desc="labeling"):
+    """Label many texts concurrently, aggregating votes.
+
+    Returns (DataFrame[text, label, confidence], total_cost_usd). Unresolvable items
+    get the INVALID label and confidence 0.0.
+    """
+    unique, ballots, total_cost = cast_ballots(
+        texts, prompt, model, labels, votes, conn, concurrency, desc
+    )
     verdicts = {}
     for text, votes_cast in zip(unique, ballots, strict=True):
         valid = [label for label in votes_cast if label is not None]

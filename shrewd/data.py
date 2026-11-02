@@ -1,4 +1,6 @@
+import json
 import warnings
+from pathlib import Path
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -73,3 +75,20 @@ def usable_pool(pool, dev, test):
     seen = set(dev["text"]) | set(test["text"])
     overlap = valid["text"].isin(seen)
     return valid[~overlap], int(overlap.sum())
+
+
+BEFORE_FILE = "review_before.json"
+
+
+def read_before(folder):
+    """The teachers' answers on reviewed rows, which unreview() restores."""
+    path = Path(folder) / BEFORE_FILE
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def write_before(folder, before):
+    path = Path(folder) / BEFORE_FILE
+    if before:
+        path.write_text(json.dumps(before))
+    else:
+        path.unlink(missing_ok=True)

@@ -7,14 +7,60 @@ calibration and stacking work unchanged. Defaults (6 epochs, CLS pooling, ranked
 clipping on) come from the sweeps in BENCHMARKS.md.
 
 Needs torch and transformers: `pip install "shrewd[encoder]"`.
+
+`checkpoint_dir=` saves the training state after every epoch, so an interrupted fit
+resumes from the last finished one.
 """
 
+import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
 
 DEFAULT_MODEL = "answerdotai/ModernBERT-base"
+
+
+def fit_key(*parts):
+    """A stable key for one fit, from its settings and data."""
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(repr(part).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+class Checkpoint:
+    """Saves and restores training state after each epoch. Does nothing without a directory."""
+
+    def __init__(self, directory, key):
+        self.path = Path(directory) / f"{key}.pt" if directory else None
+
+    def load(self):
+        if self.path is None or not self.path.exists():
+            return None
+        import torch
+
+        return torch.load(self.path, map_location="cpu", weights_only=False)
+
+    def save(self, state):
+        if self.path is None:
+            return
+        import torch
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        partial = self.path.with_suffix(".partial")
+        try:
+            torch.save(state, partial)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+        partial.replace(self.path)
+
+    def clear(self):
+        if self.path is not None:
+            self.path.unlink(missing_ok=True)
+            self.path.with_suffix(".partial").unlink(missing_ok=True)
 
 
 class EncoderFeatures:
@@ -24,7 +70,8 @@ class EncoderFeatures:
 
     def __init__(self, model=DEFAULT_MODEL, epochs=6, lr=3e-5, batch_size=16, max_length=256,
                  micro_batch=8,
-                 seed=42, device=None, spherical=0.5, ranked=0.0, clip=1.0, pooling="cls"):
+                 seed=42, device=None, spherical=0.5, ranked=0.0, clip=1.0, pooling="cls",
+                 checkpoint_dir=None):
         try:
             import torch  # noqa: F401
             import transformers  # noqa: F401
@@ -44,15 +91,19 @@ class EncoderFeatures:
         self.ranked = ranked
         self.clip = clip
         self.pooling = pooling
+        self.checkpoint_dir = checkpoint_dir
         self._tok = self._trunk = None
 
     # -- sklearn-ish surface ----------------------------------------------------
 
     def get_params(self, deep=True):
-        return {k: getattr(self, k) for k in (
+        params = {k: getattr(self, k) for k in (
             "model", "epochs", "lr", "batch_size", "max_length", "micro_batch", "seed", "device",
             "spherical", "ranked", "clip", "pooling",
         ) if k != "model"} | {"model": self.model_name}
+        if self.checkpoint_dir is not None:
+            params["checkpoint_dir"] = self.checkpoint_dir
+        return params
 
     def set_params(self, **params):
         for key, value in params.items():
@@ -119,8 +170,23 @@ class EncoderFeatures:
         steps = self.epochs * ((len(texts) + self.batch_size - 1) // self.batch_size)
         sched = transformers.get_linear_schedule_with_warmup(opt, int(0.1 * steps), steps)
         gen = torch.Generator().manual_seed(self.seed)
+        checkpoint = Checkpoint(self.checkpoint_dir, fit_key(
+            "panel", self.get_params() | {"checkpoint_dir": None}, keys, texts,
+            [targets[k].tobytes() for k in keys],
+        ))
+        first = 0
+        state = checkpoint.load()
+        if state is not None:
+            self._trunk.load_state_dict(state["trunk"])
+            heads.load_state_dict(state["heads"])
+            opt.load_state_dict(state["opt"])
+            sched.load_state_dict(state["sched"])
+            gen.set_state(state["gen"])
+            torch.set_rng_state(state["rng"])
+            first = state["epoch"]
+            print(f"resuming the encoder fine-tune after epoch {first} of {self.epochs}")
         self._trunk.train()
-        for epoch in range(self.epochs):
+        for epoch in range(first, self.epochs):
             order = torch.randperm(len(texts), generator=gen)
             for start in tqdm(range(0, len(texts), self.batch_size),
                               desc=f"encoder epoch {epoch + 1}/{self.epochs}"):
@@ -153,6 +219,12 @@ class EncoderFeatures:
                 opt.step()
                 sched.step()
                 opt.zero_grad()
+            if epoch + 1 < self.epochs:
+                checkpoint.save({"epoch": epoch + 1, "trunk": self._trunk.state_dict(),
+                                 "heads": heads.state_dict(), "opt": opt.state_dict(),
+                                 "sched": sched.state_dict(), "gen": gen.get_state(),
+                                 "rng": torch.get_rng_state()})
+        checkpoint.clear()
         self._trunk.eval()
         # the optimizer's moments are twice the trunk's size and the caching allocator
         # keeps every freed block. Without this, three folds plus the final fit grow to
@@ -186,7 +258,8 @@ class EncoderFeatures:
         path.mkdir(parents=True, exist_ok=True)
         self._trunk.save_pretrained(str(path / "trunk"))
         self._tok.save_pretrained(str(path / "trunk"))
-        (path / "features.json").write_text(json.dumps(self.get_params(), indent=2))
+        params = {k: v for k, v in self.get_params().items() if k != "checkpoint_dir"}
+        (path / "features.json").write_text(json.dumps(params, indent=2))
 
     @classmethod
     def load_from(cls, path):

@@ -97,6 +97,27 @@ def test_parse_answers_skips_what_it_cannot_read():
     assert decide.parse_answers("not json at all", QUESTIONS) == {}
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"answers": {"severity": {"0": 0.1, "1": 0.2, "2": 0.7}}}',          # as asked
+        '{"answers": {"severity": {"minor": 0.1, "normal": 0.2, "blocking": 0.7}}}',
+        '{"answers": {"severity": {"0: minor": 0.1, "1: normal": 0.2, "2: blocking": 0.7}}}',
+        '{"answers": {"severity": {"probabilities": {"Minor": 1, "normal": 2, "BLOCKING": 7}}}}',
+    ],
+)
+def test_a_score_reads_levels_by_index_or_by_name(payload):
+    answers = decide.parse_answers(payload, {"severity": QUESTIONS["severity"]})
+    assert answers["severity"] == pytest.approx([0.1, 0.2, 0.7])
+
+
+def test_a_score_named_by_level_becomes_a_one_hot():
+    answers = decide.parse_answers('{"answers": {"severity": "blocking"}}', QUESTIONS)
+    assert answers["severity"] == pytest.approx([0, 0, 1])
+    # a choice's options are matched as before, and an unknown level is still unread
+    assert decide.parse_answers('{"answers": {"severity": {"huge": 1}}}', QUESTIONS) == {}
+
+
 def test_bare_label_becomes_a_one_hot():
     answers = decide.parse_answers(
         '{"answers": {"department": {"choice": "billing"}}}', QUESTIONS
@@ -923,3 +944,424 @@ def test_routing_without_a_threshold_says_how_to_get_one(tmp_path, decision_teac
     assert loaded.routing is None
     with pytest.raises(ValueError, match="route_budget"):
         loaded.decide(["ticket 1"], route=True)
+
+
+# ---------------------------------------------------------------- several teachers
+
+
+@pytest.fixture
+def three_teachers(monkeypatch):
+    """Three fake teachers of falling quality: "test/good" is right on 90% of answers,
+    "test/fair" on 75%, "test/poor" on 55%, each wrong in its own way."""
+    import hashlib
+
+    from conftest import response
+
+    accuracy = {"test/good": 0.90, "test/fair": 0.75, "test/poor": 0.55}
+    calls = {"n": 0}
+
+    def truth(state, key, options):
+        if key == "department":
+            from conftest import keyword_label
+            return keyword_label(state)
+        if key == "angry":
+            return "yes" if "unacceptable" in state else "no"
+        # make_docs() labels severity i % 3 for "ticket i: ..."
+        return str(int(state.split()[1].rstrip(":")) % len(options))
+
+    def completion(model, messages, **kwargs):
+        calls["n"] += 1
+        state = messages[1]["content"]
+        answers = {}
+        for key, question in QUESTIONS.items():
+            options = question.options()
+            roll = int(hashlib.sha256(f"{model}|{key}|{state}".encode()).hexdigest(), 16)
+            said = truth(state, key, options)
+            if (roll % 1000) / 1000 >= accuracy[model]:
+                others = [o for o in options if o != said]
+                said = others[roll % len(others)]
+            probs = {o: 0.15 / (len(options) - 1) for o in options}
+            probs[said] = 0.85
+            answers[key] = {"probabilities": probs}
+        return response(json.dumps({"answers": answers}))
+
+    monkeypatch.setattr("shrewd.teacher.litellm.completion", completion)
+    monkeypatch.setattr("shrewd.teacher.litellm.completion_cost", lambda completion_response: 0.0)
+    return calls
+
+
+def test_several_teachers_are_combined_by_dev_accuracy(tmp_path, three_teachers):
+    docs = make_docs(300)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS,
+                  teacher=["test/good", "test/fair", "test/poor"])
+    assert json.loads((d.dir / "manifest.json").read_text())["teacher"] == [
+        "test/good", "test/fair", "test/poor"]
+    d.add_seed(docs.iloc[:200], test_frac=0.3)
+    frame = d.judge(docs.iloc[200:][["text"]])
+    for key, question in QUESTIONS.items():
+        columns = [f"{key}__{o}" for o in question.options()]
+        assert np.allclose(frame[columns].sum(axis=1), 1.0)
+
+    summary = json.loads((d.dir / "agreement.json").read_text())
+    dept = summary["questions"]["department"]
+    assert dept["method"] == "dawid-skene"
+    assert summary["questions"]["angry"]["method"] == "stacking"
+    # the good teacher moves the combined answer most, the poor one least
+    influence = dept["influence"]
+    assert influence["test/good"] > influence["test/poor"]
+    assert summary["pool"]["documents"] == 100
+    assert set(summary["pairwise"]) == {
+        "test/good | test/fair", "test/good | test/poor", "test/fair | test/poor"}
+
+    votes = pd.read_csv(d.dir / "votes_pool.csv")
+    assert sorted(votes["teacher"].unique()) == ["test/fair", "test/good", "test/poor"]
+    assert len(votes) == 3 * 100
+
+    # the combination is right more often than a plain average on the pool
+    gold = docs.iloc[200:].set_index("text")
+    votes_by = {t: votes[votes["teacher"] == t].set_index("text") for t in votes["teacher"]}
+    cols = [f"department__{o}" for o in QUESTIONS["department"].options()]
+    combined = frame.set_index("text").loc[gold.index, cols].to_numpy().argmax(axis=1)
+    average = np.mean([votes_by[t].loc[gold.index, cols].to_numpy() for t in votes_by], axis=0)
+    truth = np.array([QUESTIONS["department"].options().index(v) for v in gold["department"]])
+    assert (combined == truth).mean() >= (average.argmax(axis=1) == truth).mean()
+
+    review = pd.read_csv(d.dir / "needs_review.csv", dtype=str, keep_default_na=False)
+    assert "teachers" in review.columns
+    assert review["why"].str.contains("teachers split").any()
+    probs = pd.to_numeric(review.loc[~review["why"].str.startswith("spot check"),
+                                     "teacher_prob"])
+    assert (probs.loc[review["why"] == "teachers split"] < 0.9).all()
+    assert probs.is_monotonic_increasing
+
+    result = d.distill(features="tfidf")
+    assert set(result.metrics["teachers"]) == {"test/good", "test/fair", "test/poor"}
+    assert "each teacher alone" in result.report()
+
+
+def test_several_teachers_survive_reload_and_reuse_the_cache(tmp_path, three_teachers):
+    docs = make_docs(200)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher=["test/good", "test/fair"])
+    d.add_seed(docs.iloc[:120], test_frac=0.3)
+    d.judge(docs.iloc[120:][["text"]])
+    calls = three_teachers["n"]
+    reopened = Decisions(tmp_path / "p")
+    assert reopened.teacher == ["test/good", "test/fair"]
+    reopened.judge(docs.iloc[120:][["text"]], overwrite=True)
+    assert three_teachers["n"] == calls
+    answers = reopened.ask("ticket 7: the refund problem again this is unacceptable")
+    assert set(answers) == set(QUESTIONS)
+
+
+def test_a_human_answer_beats_several_teachers(tmp_path, three_teachers):
+    docs = make_docs(200)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher=["test/good", "test/poor"])
+    d.add_seed(docs.iloc[:120], test_frac=0.3)
+    d.judge(docs.iloc[120:][["text"]])
+    review = pd.read_csv(d.dir / "needs_review.csv", dtype=str, keep_default_na=False)
+    row = review[review["question"] == "department"].iloc[0]
+    review.loc[row.name, "human_answer"] = "bug"
+    review.to_csv(d.dir / "needs_review.csv", index=False)
+    assert d.apply_review() == 1
+    d.judge(docs.iloc[120:][["text"]], overwrite=True)
+    pool = pd.read_csv(d.dir / "pool_judged.csv").set_index("text")
+    assert pool.loc[row["text"], "department__bug"] == 1.0
+    again = pd.read_csv(d.dir / "needs_review.csv", dtype=str, keep_default_na=False)
+    assert not ((again["text"] == row["text"]) & (again["question"] == "department")).any()
+
+
+def test_several_teachers_need_distinct_models(tmp_path):
+    with pytest.raises(ValueError, match="distinct"):
+        Decisions(tmp_path / "p", questions=QUESTIONS, teacher=["test/a", "test/a"])
+    from shrewd.judge import EnsembleBackend
+    with pytest.raises(ValueError, match="not both"):
+        Decisions(tmp_path / "p", questions=QUESTIONS, teacher=["test/a", "test/b"],
+                  backend=EnsembleBackend(["test/c", "test/d"]))
+
+
+def test_escalation_asks_the_others_only_where_the_first_teacher_might_be_overruled(
+        tmp_path, three_teachers, monkeypatch):
+    """A first teacher that states 0.99 when it is right and 0.55 when it isn't is easy to
+    trust selectively; the others should be asked about roughly the documents it got wrong."""
+    import shrewd.teacher as teacher_module
+
+    honest = teacher_module.litellm.completion
+
+    def completion(model, messages, **kwargs):
+        reply = json.loads(honest(model, messages, **kwargs).choices[0].message.content)
+        if model == "test/fair":
+            state = messages[1]["content"]
+            for key, entry in reply["answers"].items():
+                probs = entry["probabilities"]
+                top = max(probs, key=probs.get)
+                options = QUESTIONS[key].options()
+                from conftest import keyword_label
+                truth = {"department": keyword_label(state),
+                         "angry": "yes" if "unacceptable" in state else "no",
+                         "severity": str(int(state.split()[1].rstrip(":")) % 3)}[key]
+                sure = 0.99 if top == truth else 0.55
+                entry["probabilities"] = {o: (sure if o == top else (1 - sure) / (len(options) - 1))
+                                          for o in options}
+        from conftest import response
+        return response(json.dumps(reply))
+
+    monkeypatch.setattr("shrewd.teacher.litellm.completion", completion)
+    docs = make_docs(700)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher=["test/fair", "test/good"])
+    d.add_seed(docs.iloc[:500], test_frac=0.2)
+    d.judge(docs.iloc[500:][["text"]], escalate=0.10)
+    summary = json.loads((d.dir / "agreement.json").read_text())
+    escalation = summary["escalation"]
+    assert summary["cascade"]["first"] == "test/fair"
+    assert 0 < summary["cascade"]["escalate_share"] < 1
+    assert escalation["threshold"] is not None
+    assert 0 < escalation["escalated"] < escalation["documents"]
+    votes = pd.read_csv(d.dir / "votes_pool.csv")
+    assert (votes["teacher"] == "test/fair").sum() == 200
+    assert (votes["teacher"] == "test/good").sum() == escalation["escalated"]
+    review = pd.read_csv(d.dir / "needs_review.csv", dtype=str, keep_default_na=False)
+    assert not review["why"].str.startswith("no answer").any()   # not asked is not missing
+    with pytest.raises(ValueError, match="several teachers"):
+        Decisions(tmp_path / "q", questions=QUESTIONS, teacher="test/good").judge(
+            docs.iloc[500:][["text"]], escalate=0.1)
+
+
+def test_review_records_answers_without_editing_a_csv(tmp_path, three_teachers):
+    docs = make_docs(200)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher=["test/good", "test/poor"])
+    d.add_seed(docs.iloc[:120], test_frac=0.3)
+    d.judge(docs.iloc[120:][["text"]])
+    queue = pd.read_csv(d.dir / "needs_review.csv", dtype=str, keep_default_na=False)
+    first = queue.iloc[0]
+    answer = "2" if first["question"] == "severity" else (
+        "yes" if first["question"] == "angry" else "bug")
+    assert d.review([{"text": first["text"], "question": first["question"],
+                      "answer": answer}]) == 1
+    after = pd.read_csv(d.dir / "needs_review.csv", dtype=str, keep_default_na=False)
+    assert len(after) == len(queue) - 1
+    ledger = pd.read_csv(d.dir / "reviewed.csv", dtype=str)
+    assert (ledger["text"] == first["text"]).any()
+
+
+def test_adding_a_teacher_reuses_what_the_first_one_was_paid_for(tmp_path, three_teachers):
+    docs = make_docs(160)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher="test/good")
+    d.add_seed(docs.iloc[:100], test_frac=0.3)
+    d.judge(docs.iloc[100:][["text"]])
+    before = three_teachers["n"]
+    d.set_teacher(["test/good", "test/fair"])
+    assert Decisions(tmp_path / "p").teacher == ["test/good", "test/fair"]
+    d.judge(docs.iloc[100:][["text"]], overwrite=True)
+    # the pool is not asked of test/good again; what's new is test/fair on the 60 pool
+    # documents and both teachers on the 70 dev documents the combination is fit on
+    assert three_teachers["n"] - before == 60 + 2 * 70
+    assert (d.dir / "agreement.json").exists()
+
+
+def test_checking_teachers_before_the_pool(tmp_path, three_teachers):
+    docs = make_docs(200)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher=["test/good", "test/poor"])
+    d.add_seed(docs.iloc[:120], test_frac=0.3)
+    estimate = d.check_teachers(dry_run=True)
+    assert estimate["uncached_calls"] == 2 * 84
+    summary = d.check_teachers()
+    for key in QUESTIONS:
+        accuracy = summary["questions"][key]["dev_accuracy"]
+        assert accuracy["test/good"] > accuracy["test/poor"]
+        gap = summary["disagreements"][key]
+        assert gap["wrong"] == sum(p["count"] for p in gap["pairs"]) or len(gap["pairs"]) == 5
+    calls = three_teachers["n"]
+    d.judge(docs.iloc[120:][["text"]])
+    assert three_teachers["n"] - calls == 2 * 80          # dev was already answered
+
+
+def test_a_question_can_change_and_only_it_is_asked_again(tmp_path, decision_teacher):
+    docs = make_docs(120)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[:60], test_frac=0.4)
+    d.judge(docs.iloc[60:][["text"]])
+    calls = decision_teacher.calls
+    changed = Score(instructions="How severe is this, for the customer?",
+                    criteria=["minor", "normal", "blocking"])
+    assert d.set_question("severity", changed)
+    assert not d.set_question("severity", changed)             # unchanged: nothing to do
+    d.judge(docs.iloc[60:][["text"]], overwrite=True)
+    assert decision_teacher.calls - calls == 60   # one call per document, for severity only
+    reopened = Decisions(tmp_path / "p")
+    assert reopened.questions["severity"].instructions.endswith("customer?")
+
+
+def test_seed_documents_can_be_added_and_fixed(tmp_path, decision_teacher):
+    docs = make_docs(160)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[:60], test_frac=0.4)
+    dev_n, test_n = d.add_examples(docs.iloc[60:100])
+    assert dev_n + test_n == 40
+    text = pd.read_csv(d.dir / "seed_dev.csv")["text"].iloc[0]
+    assert d.fix_example(text, {"angry": "yes", "severity": "blocking"}) == "dev"
+    row = pd.read_csv(d.dir / "seed_dev.csv", dtype=str).set_index("text").loc[text]
+    assert row["angry"] == "yes" and row["severity"] == "blocking"
+    with pytest.raises(ValueError, match="not one of"):
+        d.fix_example(text, {"severity": "catastrophic"})
+
+
+def test_compare_scores_featurizations_on_dev_without_the_test_set(tmp_path, decision_teacher):
+    import json
+
+    docs = make_docs(240)
+    d = Decisions(tmp_path / "panel", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[:120], test_frac=0.4)
+    d.judge(docs.iloc[120:][["text"]])
+    calls = decision_teacher.calls
+    rows = d.compare(features=["tfidf"])
+    assert decision_teacher.calls == calls  # no teacher on the test set, no API calls at all
+    assert [r["features"] for r in rows] == ["tfidf"]
+    assert set(rows[0]["questions"]) <= set(QUESTIONS)
+    for score in rows[0]["questions"].values():
+        assert 0.0 <= score["dev_accuracy"] <= 1.0 and score["n"] > 0
+    assert (tmp_path / "panel" / "candidates" / "tfidf" / "meta.json").exists()
+    assert json.loads((tmp_path / "panel" / "compare.json").read_text())["candidates"] == rows
+    assert not (tmp_path / "panel" / "report.json").exists()  # nothing was tested
+
+
+def test_compare_names_repeated_featurizations_apart(tmp_path, decision_teacher):
+    docs = make_docs(200)
+    d = Decisions(tmp_path / "panel", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[:100], test_frac=0.4)
+    d.judge(docs.iloc[100:][["text"]])
+    rows = d.compare(features=["tfidf", "tfidf"])
+    assert [r["features"] for r in rows] == ["tfidf", "tfidf-2"]
+
+
+def test_encoder_checkpoints_are_off_by_default_and_never_saved():
+    from shrewd.encoder import Checkpoint, EncoderFeatures, fit_key
+
+    assert Checkpoint(None, "k").load() is None
+    Checkpoint(None, "k").save({"epoch": 1})  # a no-op without a directory
+    assert fit_key("a", 1) == fit_key("a", 1) != fit_key("a", 2)
+    try:
+        plain = EncoderFeatures()
+    except ImportError:
+        pytest.skip("needs shrewd[encoder]")
+    assert "checkpoint_dir" not in plain.get_params()
+    kept = EncoderFeatures(checkpoint_dir="/tmp/x")
+    assert kept.get_params()["checkpoint_dir"] == "/tmp/x"  # clones keep it
+
+
+def _judged_panel(tmp_path, n=200):
+    docs = make_docs(n)
+    d = Decisions(tmp_path / "panel", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[: n // 2], test_frac=0.4)
+    d.judge(docs.iloc[n // 2:][["text"]])
+    return d
+
+
+def test_a_question_can_be_removed_without_asking_again(tmp_path, decision_teacher):
+    import json
+
+    d = _judged_panel(tmp_path)
+    calls = decision_teacher.calls
+    assert d.remove_question("angry")
+    assert decision_teacher.calls == calls
+    assert "angry" not in d.questions
+    assert "angry" not in json.loads((d.dir / "manifest.json").read_text())["questions"]
+    for name in ("seed_dev.csv", "seed_test.csv"):
+        assert "angry" not in pd.read_csv(d.dir / name).columns
+    pool_columns = pd.read_csv(d.dir / "pool_judged.csv").columns
+    assert not [c for c in pool_columns if c.startswith("angry__")]
+    d.distill(features="tfidf")
+    from shrewd import load
+
+    assert set(load(d.dir).calibrators) == set(QUESTIONS) - {"angry"}
+
+
+def test_a_panel_keeps_at_least_one_question(tmp_path, decision_teacher):
+    d = _judged_panel(tmp_path, 80)
+    d.remove_question("angry")
+    d.remove_question("severity")
+    with pytest.raises(ValueError, match="at least one question"):
+        d.remove_question("department")
+    with pytest.raises(ValueError, match="not a question"):
+        d.remove_question("nope")
+
+
+def test_choice_options_merge_and_their_probabilities_add_up(tmp_path, decision_teacher):
+    d = _judged_panel(tmp_path)
+    options = QUESTIONS["department"].options()
+    source, target = options[0], options[1]
+    calls = decision_teacher.calls
+    assert d.merge_options("department", {source: target})
+    assert decision_teacher.calls == calls
+    assert d.questions["department"].options() == [o for o in options if o != source]
+    pool = pd.read_csv(d.dir / "pool_judged.csv")
+    assert f"department__{source}" not in pool.columns
+    share = pool[[f"department__{o}" for o in d.questions["department"].options()]].sum(axis=1)
+    assert share.round(6).eq(1).all()
+    for name in ("seed_dev.csv", "seed_test.csv"):
+        assert source not in set(pd.read_csv(d.dir / name, dtype=str)["department"])
+    d.distill(features="tfidf")
+
+
+def test_only_choice_options_merge(tmp_path, decision_teacher):
+    d = _judged_panel(tmp_path, 80)
+    with pytest.raises(ValueError, match="choice"):
+        d.merge_options("severity", {"low": "medium"})
+    options = QUESTIONS["department"].options()
+    with pytest.raises(ValueError, match="stays"):
+        d.merge_options("department", {options[0]: options[1], options[1]: options[0]})
+
+
+def test_a_pruned_panel_still_answers_through_its_teachers(tmp_path, three_teachers):
+    from shrewd import load, prune
+
+    docs = make_docs(200)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher=["test/good", "test/fair"])
+    d.add_seed(docs.iloc[:120], test_frac=0.3)
+    d.judge(docs.iloc[120:][["text"]])
+    d.distill(features="tfidf")
+    text = "ticket 7: the refund problem again this is unacceptable"
+    before = Decisions(tmp_path / "p").ask(text)
+    prune(d.dir)
+    assert not (d.dir / "cache.db").exists() and (d.dir / "seed_dev.csv").exists()
+    assert set(load(d.dir).decide([text])[0]) == set(QUESTIONS)
+    assert Decisions(tmp_path / "p").ask(text) == before
+
+
+def test_unreview_takes_back_one_question_or_all(tmp_path, three_teachers):
+    docs = make_docs(200)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher=["test/good", "test/fair"])
+    d.add_seed(docs.iloc[:120], test_frac=0.3)
+    d.judge(docs.iloc[120:][["text"]])
+    pool = pd.read_csv(d.dir / "pool_judged.csv")
+    text = str(pool["text"].iloc[0])
+    keys = list(QUESTIONS)
+    original = pool.iloc[0].copy()
+    d.review([{"text": text, "question": keys[0], "answer": QUESTIONS[keys[0]].options()[0]},
+              {"text": text, "question": keys[1], "answer": QUESTIONS[keys[1]].options()[-1]}])
+    calls = three_teachers["n"]
+    assert d.unreview(text, questions=[keys[0]]) == 1
+    after = pd.read_csv(d.dir / "pool_judged.csv").iloc[0]
+    for o in QUESTIONS[keys[0]].options():
+        assert after[f"{keys[0]}__{o}"] == pytest.approx(original[f"{keys[0]}__{o}"])
+    assert after[f"{keys[1]}__{QUESTIONS[keys[1]].options()[-1]}"] == 1.0
+    assert d.unreview([text]) == 1
+    assert not (d.dir / "reviewed.csv").exists() and not (d.dir / "review_before.json").exists()
+    assert three_teachers["n"] == calls
+
+    # reviewed by an older version, so no saved answer: it comes from the cache instead
+    d.review([{"text": text, "question": keys[0], "answer": QUESTIONS[keys[0]].options()[0]}])
+    (d.dir / "review_before.json").unlink()
+    assert d.unreview(text) == 1
+    again = pd.read_csv(d.dir / "pool_judged.csv").iloc[0]
+    for o in QUESTIONS[keys[0]].options():
+        assert again[f"{keys[0]}__{o}"] == pytest.approx(original[f"{keys[0]}__{o}"], abs=1e-3)
+    assert three_teachers["n"] == calls
+
+
+def test_panel_examples_can_be_removed(tmp_path, three_teachers):
+    docs = make_docs(120)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher="test/good")
+    d.add_seed(docs, test_frac=0.3)
+    dev = pd.read_csv(d.dir / "seed_dev.csv")
+    assert d.remove_examples(dev["text"].iloc[:2]) == (2, 0)
+    assert len(pd.read_csv(d.dir / "seed_dev.csv")) == len(dev) - 2

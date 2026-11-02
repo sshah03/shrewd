@@ -286,3 +286,15 @@ def test_no_parity_finding_when_student_already_matches():
         student_selective=[{"coverage": 0.9, "threshold": 0.4, "accuracy": 0.99}],
     )
     assert not [f for f in evaluate.run_rules(ctx) if "confident items" in f.title]
+
+
+def test_near_duplicates_ignore_numbers_and_find_the_closest_copy():
+    from shrewd.evaluate import near_duplicates
+
+    test = ["I was charged twice for order 1043", "the app crashes on start", "totally new"]
+    train = ["something else entirely", "I was charged twice for order 2207",
+             "the app crashes when I open settings"]
+    pairs = near_duplicates(test, train, threshold=0.9)
+    assert pairs[0][:2] == (0, 1) and pairs[0][2] > 0.99
+    assert all(i != 2 for i, _, _ in pairs)
+    assert near_duplicates([], train) == [] and near_duplicates(["123"], ["456"]) == []

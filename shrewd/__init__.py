@@ -12,12 +12,13 @@ if TYPE_CHECKING:
     from shrewd.evaluate import Finding as Finding
     from shrewd.project import Project as Project
     from shrewd.students import load as load
+    from shrewd.students import prune as prune
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "Choice", "Decisions", "DistillResult", "Finding", "Noul", "Project", "Score",
-    "autotune", "load",
+    "autotune", "load", "prune",
 ]
 
 
@@ -52,10 +53,10 @@ def __getattr__(name):
             from shrewd._autotune import autotune
 
         return autotune
-    if name == "load":
-        from shrewd.students import load
+    if name in ("load", "prune"):
+        from shrewd import students
 
-        return load
+        return getattr(students, name)
     if name in ("Choice", "Noul", "Score"):
         from shrewd import decide
 

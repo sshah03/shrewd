@@ -319,10 +319,39 @@ def parse_answers(content, questions):
     for key, question in questions.items():
         if key not in by_id:
             continue
-        vec = _distribution(by_id[key], question.options())
+        vec = _distribution(_level_keys(by_id[key], question), question.options())
         if vec is not None:
             out[key] = vec
     return out
+
+
+def _level_keys(raw, question):
+    if getattr(question, "kind", None) != "score":
+        return raw
+    named = {str(c).strip().lower(): str(i) for i, c in enumerate(question.criteria)}
+    indices = set(question.options())
+
+    def index(key):
+        text = str(key).strip()
+        if text in indices:
+            return text
+        lead = re.match(r"^(\d+)\s*[:.)\-]", text)
+        if lead and lead.group(1) in indices:
+            return lead.group(1)
+        return named.get(text.lower(), key)
+
+    if isinstance(raw, str):
+        return index(raw)
+    if isinstance(raw, dict):
+        probs = raw.get("probabilities", raw)
+        if isinstance(probs, dict):
+            mapped = {}
+            for k, v in probs.items():
+                mapped[index(k)] = v
+            return {**raw, "probabilities": mapped} if "probabilities" in raw else mapped
+        if raw.get("score") is not None and not isinstance(raw.get("score"), (int, float)):
+            return {**raw, "score": index(raw["score"])}
+    return raw
 
 
 def missing_ids(answers, questions):

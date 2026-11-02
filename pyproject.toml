@@ -41,12 +41,12 @@ Issues = "https://github.com/sshah03/shrewd/issues"
 # exact gepa pin: the glue in optimize.py is verified against this version's adapter
 # internals (gepa is 0.x with a moving API)
 teacher = ["litellm>=1.70", "gepa==0.1.4"]
-embed = ["model2vec>=0.3"]
+embed = ["model2vec>=0.3,<0.10"]
 setfit = ["setfit>=1.1", "transformers<5"]
 encoder = ["torch>=2.2", "transformers>=4.48,<5"]
 all = [
     "litellm>=1.70", "gepa==0.1.4",
-    "model2vec>=0.3", "setfit>=1.1", "torch>=2.2", "transformers>=4.48,<5",
+    "model2vec>=0.3,<0.10", "setfit>=1.1", "torch>=2.2", "transformers>=4.48,<5",
 ]
 dev = ["pytest>=8", "ruff>=0.5", "litellm>=1.70", "gepa==0.1.4"]
 

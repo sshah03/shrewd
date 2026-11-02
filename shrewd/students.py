@@ -25,12 +25,20 @@ class Student(Protocol):
     def save(self, path: Path) -> None: ...
 
 
+ROUTING_FILE = "routing.json"
+
+
 class _Student:
     """predict() shared by every built-in student: argmax of predict_proba, with an
     optional confidence floor. Rows whose top probability is below `min_confidence`
     come back as None so the caller can route them elsewhere."""
 
-    def predict(self, texts, min_confidence=0.0):
+    routing = None
+
+    def predict(self, texts, min_confidence=0.0, route=False, fallback=None):
+        """`route=True` returns None for texts below the routing threshold; `fallback` answers
+        those instead.
+        """
         proba = self.predict_proba(texts)
         labels = [self.classes_[i] for i in proba.argmax(axis=1)]
         if min_confidence:
@@ -39,7 +47,34 @@ class _Student:
                 label if p >= min_confidence else None
                 for label, p in zip(labels, top, strict=True)
             ]
+        if route or fallback is not None:
+            local = self._local_from(proba)
+            labels = [label if ok else None for label, ok in zip(labels, local, strict=True)]
+            if fallback is not None and not local.all():
+                rest = [t for t, ok in zip(texts, local, strict=True) if not ok]
+                answers = list(fallback(rest))
+                if len(answers) != len(rest):
+                    raise ValueError(
+                        f"fallback returned {len(answers)} labels for {len(rest)} texts")
+                answers = iter(answers)
+                labels = [label if ok else next(answers)
+                          for label, ok in zip(labels, local, strict=True)]
         return labels
+
+    def local(self, texts):
+        """True for each text the model answers itself under routing."""
+        return self._local_from(self.predict_proba(list(texts)))
+
+    def _local_from(self, proba):
+        if not self.routing:
+            raise ValueError(
+                "this model has no routing threshold; distill with route_budget= (for "
+                "example 0.02) to set one with a guarantee"
+            )
+        threshold = self.routing["threshold"]
+        if threshold is None:
+            return np.zeros(len(proba), dtype=bool)
+        return proba.max(axis=1) >= threshold
 
 
 def _write_meta(path, kind, student, **extra):
@@ -219,7 +254,7 @@ class EncoderStudent(_Student):
     """Full cross-entropy fine-tune of a small encoder. Strongest student at 1k+ rows."""
 
     def __init__(self, model="answerdotai/ModernBERT-base", seed=42, epochs=5, lr=3e-5,
-                 batch_size=16, max_length=256):
+                 batch_size=16, max_length=256, checkpoint_dir=None):
         try:
             import torch  # noqa: F401
             import transformers  # noqa: F401
@@ -234,6 +269,7 @@ class EncoderStudent(_Student):
         self._lr = lr
         self._batch_size = batch_size
         self._max_length = max_length
+        self._checkpoint_dir = checkpoint_dir
         self._model = None
         self._tokenizer = None
         self._device = None
@@ -251,6 +287,8 @@ class EncoderStudent(_Student):
         import torch
         import transformers
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        from shrewd.encoder import Checkpoint, fit_key
 
         torch.manual_seed(self._seed)
         self.classes_ = sorted(set(labels))
@@ -270,7 +308,21 @@ class EncoderStudent(_Student):
         scheduler = transformers.get_linear_schedule_with_warmup(
             optimizer, int(0.1 * total_steps), total_steps
         )
-        for epoch in range(self._epochs):
+        checkpoint = Checkpoint(self._checkpoint_dir, fit_key(
+            "classifier", self._base, self._seed, self._epochs, self._lr, self._batch_size,
+            self._max_length, texts, list(labels),
+        ))
+        first = 0
+        state = checkpoint.load()
+        if state is not None:
+            self._model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["opt"])
+            scheduler.load_state_dict(state["sched"])
+            generator.set_state(state["gen"])
+            torch.set_rng_state(state["rng"])
+            first = state["epoch"]
+            print(f"resuming the encoder fine-tune after epoch {first} of {self._epochs}")
+        for epoch in range(first, self._epochs):
             order = torch.randperm(len(texts), generator=generator)
             batches = range(0, len(texts), self._batch_size)
             for start in tqdm(batches, desc=f"encoder epoch {epoch + 1}/{self._epochs}"):
@@ -284,6 +336,11 @@ class EncoderStudent(_Student):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+            if epoch + 1 < self._epochs:
+                checkpoint.save({"epoch": epoch + 1, "model": self._model.state_dict(),
+                                 "opt": optimizer.state_dict(), "sched": scheduler.state_dict(),
+                                 "gen": generator.get_state(), "rng": torch.get_rng_state()})
+        checkpoint.clear()
         self._model.eval()
         self.n_train_ = len(texts)
 
@@ -371,7 +428,10 @@ def load_student(path, student_cls=None):
             f"unknown student type {meta['type']!r}; pass student_cls=YourStudent "
             "(a class with a _load(path, meta) classmethod)"
         )
-    return cls._load(path, meta)
+    student = cls._load(path, meta)
+    if (path / ROUTING_FILE).exists():
+        student.routing = json.loads((path / ROUTING_FILE).read_text())
+    return student
 
 
 def fetch_project(url, cache_dir=None):
@@ -398,6 +458,38 @@ def fetch_project(url, cache_dir=None):
                 child.rename(target / child.name)
             inner[0].rmdir()
     return target
+
+
+KEEP_FOR_USE = ("manifest.json", "student", "prompt.txt", "prompt_header.txt", "report.json",
+                "agreement.json")
+
+
+def prune(project_dir, dry_run=False, keep=()):
+    """Delete what a shipped project doesn't need for load() and the teacher fallback: the test
+    set, the pool, the teacher cache, candidates and checkpoints. Returns the paths removed
+    (or, with `dry_run=True`, that would be). `keep` names more files or folders to leave.
+    """
+    import shutil
+
+    project_dir = Path(project_dir)
+    manifest_path = project_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"{project_dir} is not a shrewd project (no manifest.json)")
+    if not (project_dir / "student" / "meta.json").exists():
+        raise FileNotFoundError(f"no trained student in {project_dir}; run distill() first")
+    manifest = json.loads(manifest_path.read_text())
+    teacher = manifest.get("teacher")
+    kept = set(KEEP_FOR_USE) | set(keep)
+    if isinstance(teacher, list) and len(teacher) > 1:
+        kept.add("seed_dev.csv")
+    doomed = sorted(p for p in project_dir.iterdir() if p.name not in kept)
+    if not dry_run:
+        for path in doomed:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    return doomed
 
 
 def load(project_dir, student_cls=None):

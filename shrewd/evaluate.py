@@ -65,6 +65,26 @@ class DistillResult:
                 f"note: teacher gave unparseable output on {m['teacher_invalid_on_test']}"
                 f"/{m['n_test']} test rows (counted as wrong)",
             ]
+        routing = m.get("routing")
+        if routing:
+            if routing.get("threshold") is None:
+                text = (f"routing: {routing['n']} held-out rows could not certify a "
+                        f"{routing['budget']:.0%} disagreement budget, so nothing is labeled "
+                        "locally")
+            else:
+                text = (f"routing: label locally when the top probability is at least "
+                        f"{routing['threshold']:.3f}. At most {routing['budget']:.0%} of all "
+                        f"requests get a local label the teacher disagrees with "
+                        f"({1 - routing['delta']:.0%} bound, set on {routing['n']} held-out "
+                        f"rows, {routing['coverage']:.1%} of them local).")
+                t = routing.get("test") or {}
+                if t.get("n_local"):
+                    text += (f" On the test set {t['coverage']:.1%} are local, and those are "
+                             f"wrong {t['student_error']:.1%} of the time (the teacher "
+                             f"{t['teacher_error']:.1%} on the same rows).")
+            import textwrap
+
+            lines += ["", *textwrap.wrap(text, width=88, subsequent_indent=" " * 9)]
         if m.get("pool_rows_duplicating_seed"):
             lines += [
                 "",
@@ -393,3 +413,28 @@ def run_rules(ctx):
         elif result:
             findings.extend(result)
     return sorted(findings, key=lambda f: _SEVERITY_ORDER[f.severity])
+
+
+def near_duplicates(texts, others, threshold=0.9):
+    """Pairs (i, j, similarity) where texts[i] and others[j] are nearly the same text, ignoring
+    numbers. Each text is paired with its closest match only.
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    texts, others = list(texts), list(others)
+    if not texts or not others:
+        return []
+    vectorizer = TfidfVectorizer(token_pattern=r"(?u)\b[^\d\W]{2,}\b", sublinear_tf=True)
+    try:
+        vectorizer.fit(texts + others)
+    except ValueError:
+        return []
+    a, b = vectorizer.transform(texts), vectorizer.transform(others)
+    out = []
+    for start in range(0, a.shape[0], 512):
+        sims = (a[start:start + 512] @ b.T).toarray()
+        best = sims.argmax(axis=1)
+        for k, j in enumerate(best):
+            if sims[k, j] >= threshold:
+                out.append((start + k, int(j), round(float(sims[k, j]), 4)))
+    return out

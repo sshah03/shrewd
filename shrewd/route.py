@@ -16,6 +16,8 @@ outcomes, no multiplicity correction is needed.
 import numpy as np
 from scipy.stats import beta
 
+HELD_FILE = "routing_held.json"
+
 
 def cp_upper(k, n, delta):
     """One-sided Clopper-Pearson upper bound on a rate after `k` events in `n` trials."""
@@ -83,3 +85,52 @@ def pick_threshold(scores, disagree, budget=0.02, delta=0.05):
         "bound": round(bound, 4),
     }
     return best, stats
+
+
+def _held(project_dir):
+    from pathlib import Path
+
+    path = Path(project_dir) / "student" / HELD_FILE
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found; distill with route_budget= to set a routing threshold first "
+            "(models trained before shrewd 0.4 didn't keep the scores this needs)"
+        )
+    import json
+
+    held = json.loads(path.read_text())
+    return np.asarray(held["scores"], dtype=float), np.asarray(held["disagree"], dtype=bool)
+
+
+def curve(project_dir, budgets=(0.01, 0.02, 0.05, 0.1), delta=0.05):
+    """For each budget, the threshold and the share answered locally, from the held-out rows
+    the threshold was set on.
+    """
+    scores, disagree = _held(project_dir)
+    out = []
+    for budget in budgets:
+        _, stats = pick_threshold(scores, disagree, budget, delta)
+        out.append(stats)
+    return out
+
+
+def rebudget(project_dir, budget, delta=0.05):
+    """Change a trained model's routing budget without retraining. Returns the new routing
+    stats.
+    """
+    import json
+    from pathlib import Path
+
+    scores, disagree = _held(project_dir)
+    _, stats = pick_threshold(scores, disagree, budget, delta)
+    student = Path(project_dir) / "student"
+    meta = json.loads((student / "meta.json").read_text())
+    if meta.get("type") == "decisions":
+        stats = {**stats, "questions": (meta.get("routing") or {}).get("questions")}
+        meta["routing"] = stats
+        (student / "meta.json").write_text(json.dumps(meta, indent=2))
+    else:
+        from shrewd.students import ROUTING_FILE
+
+        (student / ROUTING_FILE).write_text(json.dumps(stats, indent=2))
+    return stats

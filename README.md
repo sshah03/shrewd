@@ -157,7 +157,19 @@ Options:
   disagreed on or could not answer, with an empty `human_label` column. Fill in the ones
   you care about and the next `distill()` uses them at confidence 1.0. Pass
   `teacher=[...]` with two or more models, or `votes=3`, to get disagreements to review.
-  With one teacher and one vote the queue stays empty.
+  With one teacher and one vote the queue stays empty. `proj.review([{"text": ..., "label":
+  ...}])` does the same without editing the file.
+- **Weigh teachers by how well they match you.** With several teachers, the majority wins
+  by default. `proj.label(pool, combine="weighted")` also has each teacher label your dev
+  split and weighs its votes by how often it matched your labels there.
+- **Check the teachers first.** `proj.check_teachers()` has each teacher label only your
+  dev split, so you see how often each one matches you before paying for the pool.
+- **Send the unsure ones to the teacher.** `proj.distill(route_budget=0.02)` sets a
+  confidence threshold the same way decision panels do, and
+  `load(dir).predict(texts, fallback=proj.ask)` labels the rest with the teacher.
+- **Resume long fine-tunes.** `distill(student="encoder", checkpoint_dir=...)` saves the
+  training state after each epoch, so a stopped run picks up where it left off.
+  `EncoderFeatures(checkpoint_dir=...)` does the same for panels. Off by default.
 - **Pick a student.** `"tfidf"` (default, instant), `"embed"` (static embeddings), `"encoder"`
   (fine-tuned ModernBERT), `"setfit"` (contrastive fine-tuning), or your own object with
   `fit` / `predict` / `predict_proba` / `classes_` / `save`.
@@ -265,9 +277,14 @@ Options:
   with. Then `dec.decide(texts, fallback=d.ask)` answers the rest with the teacher, or
   `route=True` leaves them as `None`. It needs about a thousand judged documents to be
   worth it. Part 2 has the numbers.
-- **Use several teachers.** `backend=EnsembleBackend(["anthropic/claude-fable-5-1",
-  "openai/gpt-6-astra"])` averages their distributions. `backend="logprobs"` reads token
-  probabilities where the API exposes them (OpenAI-compatible endpoints).
+- **Use several teachers.** `teacher=["anthropic/claude-haiku-5-5", "openai/gpt-6-astra"]`
+  has each answer every document, your dev split included, and combines them per question
+  by how often each matched your labels. `d.check_teachers()` shows that before you pay for
+  the pool, and `judge(pool, escalate=0.05)` asks the others only where the first teacher
+  might be overruled.
+- **Average teachers instead.** `backend=EnsembleBackend([...])` averages their
+  distributions with fixed weights. `backend="logprobs"` reads token probabilities where the
+  API exposes them (OpenAI-compatible endpoints).
 
 Adding a question later is cheap. Answers are cached per `(model, question, document)`, so
 a ninth question reuses the eight you already paid for. Changing a question's text or
@@ -353,29 +370,49 @@ etc.) were only ever answered by the teacher, and ship that way.
 
 | | |
 |---|---|
-| `Project(dir, instructions=, labels=, teacher=, seed=42)` | create, or reload if `dir` has a manifest. `teacher` may be a list: each labels, the majority wins, confidence is the share that agreed |
+| `Project(dir, instructions=, labels=, teacher=, seed=42)` | create, or reload if `dir` has a manifest. `teacher` may be a list: each labels, the majority wins (or see `combine=`), confidence is the share that agreed |
 | `.add_seed(df, test_frac=0.35)` | validate, split, and lock the test set |
 | `.optimize(budget=800, target=None, reflection_model=None)` | optimize the teacher prompt on the dev split |
-| `.label(df, votes=1, dry_run=False, concurrency=8, budget_usd=None, n=None)` | teacher-label the pool. `dry_run` prices it first. `budget_usd` or `n` switches to active acquisition |
+| `.label(df, votes=1, dry_run=False, concurrency=8, budget_usd=None, n=None, combine=None)` | teacher-label the pool. `dry_run` prices it first. `budget_usd` or `n` switches to active acquisition. `combine="weighted"` weighs several teachers by their dev accuracy |
 | `.distill(student="tfidf", min_confidence=0.0, **kwargs)` | apply any human labels, train student, evaluate both, diagnose |
 | `.apply_review()` | overrule the teacher wherever `human_label` is filled in `needs_review.csv`. ledgered so relabeling keeps it |
+| `.review([{"text":, "label":}])` | the same, without editing the file |
+| `.unreview(texts)` | take your labels back. those rows return to the teachers' answer, with no API calls |
+| `.remove_examples(texts)` | take documents out of your examples, from either split |
+| `.set_teacher(teacher)` | change who labels. cached answers are kept |
+| `.check_teachers(votes=1, dry_run=False)` | every teacher labels the dev split only. results in `teacher_check.json` |
+| `.distill(..., route_budget=None)` | `route_budget=0.02` holds part of the pool out and sets a routing threshold with a guarantee |
+| `.ask(texts)` | the teacher's labels, cached. Pass it as `predict(texts, fallback=proj.ask)` |
+| `.add_examples(df)` / `.fix_example(text, label)` | add hand-labeled rows without re-splitting, or correct one |
+| `.set_labels({name: description})` | change what the labels mean. relabel the pool afterwards |
+| `.add_label(name, description="")` / `.merge_labels({old: kept})` / `.remove_label(name, into=None)` | change the label set. merging rewrites your examples, the pool and the review files without asking again. retrain afterwards |
 | `.compare(students=[...], min_confidence=0.0)` | rank candidates on dev F1, accuracy at 80% coverage, latency and size |
 | `.promote(name)` | ship a compared candidate so that `load()` serves it |
-| `load(dir)` | inference-only classifier: `predict(texts, min_confidence=0.0)` / `predict_proba` / `classes_` / `labels` |
+| `load(dir)` | inference-only classifier: `predict(texts, min_confidence=0.0, route=False, fallback=None)` / `local(texts)` / `predict_proba` / `classes_` / `labels` |
+| `prune(dir, dry_run=False, keep=())` | delete what a shipped project no longer needs. `load()` and `.ask` still work; labeling and retraining don't |
 | `autotune(dir, instructions, labels, seed_df, pool_df, budget_usd=, target=None, ...)` | the ladder above, automated under a spending cap |
 
 **Calibrated decisions**
 
 | | |
 |---|---|
-| `Decisions(dir, questions=, instructions=, teacher=, backend=, seed=42)` | create, or reload if `dir` has a manifest |
+| `Decisions(dir, questions=, instructions=, teacher=, backend=, seed=42)` | create, or reload if `dir` has a manifest. `teacher` may be a list: each answers, combined per question by dev accuracy |
 | `Choice(instructions=, criteria={option: description})` | pick one of N named options (max 255) |
 | `Noul(instructions=, criteria={"true": ..., "false": ...})` | a yes/no question, answered with P(yes) |
 | `Score(instructions=, criteria=[low, ..., high])` | 2-10 ordered levels, answered with the weighted mean |
 | `.add_seed(df, test_frac=0.35)` | split hand-answered documents. `df` is text + one column per question id |
 | `.optimize(budget=800, target=None, reflection_model=None, max_header_words=None)` | GEPA-optimize the prompt header on the dev split, objective `1 - Brier/2` (a proper scoring rule, not accuracy). `max_header_words` caps the header's length if cost is a concern. writes `prompt_header.txt` |
-| `.judge(df, dry_run=False, concurrency=8)` | teacher answers every question per document in one call. writes `needs_review.csv` for its least confident answers |
+| `.judge(df, dry_run=False, concurrency=8, escalate=None)` | teacher answers every question per document in one call. writes `needs_review.csv` for its least confident answers. `escalate=0.05` asks the other teachers only where the first might be overruled |
 | `.apply_review()` | overrule the teacher wherever `human_answer` is filled in `needs_review.csv`. ledgered in `reviewed.csv` |
+| `.review([{"text":, "question":, "answer":}])` | the same, without editing the file |
+| `.unreview(texts, questions=None)` | take your answers back, for every question or only `questions`; the teachers' answers return, with no API calls |
+| `.remove_examples(texts)` | take documents out of your examples, from either split (`fix_example(text, {q: ""})` clears one answer instead) |
+| `.set_teacher(teacher)` | change who answers. cached answers are kept; re-judge to refresh the pool |
+| `.check_teachers(dry_run=False)` | every teacher answers the dev split only. results in `teacher_check.json` |
+| `.set_question(id, question)` | add a question or change one. the next `judge(overwrite=True)` asks about that question only |
+| `.remove_question(id)` / `.merge_options(id, {old: kept})` | drop a question, or merge a choice question's options, without asking again. retrain afterwards |
+| `.add_examples(df)` / `.fix_example(text, {id: answer})` | add hand-answered documents without re-splitting, or correct one |
+| `.compare(features=("tfidf", "embed"), soft=True)` | train a student per featurization on the judged pool and score each on the dev split, then `distill(features=...)` the one you pick |
 | `.distill(features="auto", soft=True, calibration="auto", calibrate_teacher=False, zero_shot=False)` | train the heads on the teacher's distributions, calibrate them on the judged pool, score against your hand labels |
 | `calibration=` | `"auto"` (picks temperature, Platt, isotonic or none per question; never changes the winning option), `"auto-full"` (also tries vector and matrix scaling, which rescale every option and can change the winner; better on multi-option questions in [BENCHMARKS.md](https://github.com/sshah03/shrewd/blob/main/BENCHMARKS.md#full-vector-calibration)), or one method by name |
 | `features=` | `"auto"` (fits tf-idf and static embeddings on the pool, keeps whichever wins on the hand-labeled dev split), `"tfidf"`, `"embed"`, `"encoder"` (fine-tuned ModernBERT, `[encoder]`), a factory, or any transformer with `fit_transform`/`transform` |
@@ -383,6 +420,10 @@ etc.) were only ever answered by the teacher, and ship that way.
 | `zero_shot=` | stack an off-the-shelf NLI model onto each head, kept per question only where it beats the plain head on the hand-labeled dev split (`[encoder]`) |
 | `.ask(texts)` | the teacher's answers in the same shape as `decide()`, cached like `judge()`'s. Pass it as `fallback=` |
 | `load(dir_or_url)` | `.decide(texts, route=False, fallback=None)` -> typed answers, `.local(texts)` -> which clear the routing threshold, `.predict_proba(texts, calibrated=True)`. an `https://...tar.gz` URL is downloaded once to `~/.cache/shrewd/` |
+
+Routing limits can change after training: `shrewd.route.curve(dir)` lists the share answered
+locally at each budget, and `shrewd.route.rebudget(dir, 0.05)` switches to one without
+retraining.
 
 Backends: `"verbalized"` (default, works everywhere), `"logprobs"` (OpenAI-compatible
 endpoints only), or `EnsembleBackend([...])` to average several teachers.
@@ -399,6 +440,9 @@ runs/tickets/
   pool_labeled.csv   text, label, confidence (and round, when acquired under a budget)
   label_log.json     the learning curve: rows labeled, dollars spent, dev accuracy per round
   needs_review.csv   rows the teachers disagreed on or could not answer (fill in human_label)
+  votes_pool.csv     each teacher's own answers, with several teachers
+  agreement.json     how each teacher matched your dev labels, and how they were combined
+  teacher_check.json check_teachers(): each teacher on the dev split, and where they differ from you
   reviewed.csv       ledger of human labels, re-applied after every label()
   cache.db           LLM response cache (sqlite)
   student/           the trained model + meta.json

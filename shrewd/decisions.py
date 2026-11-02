@@ -12,9 +12,11 @@ the result is distilled into one featurization with a calibrated head per questi
     dec.decide("I was charged twice and nobody will call me back")
 """
 
+import dataclasses
 import json
 import shutil
 import textwrap
+import time
 import warnings
 from datetime import UTC
 from pathlib import Path
@@ -25,7 +27,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
 from sklearn.model_selection import KFold
 
-from shrewd import decide
+from shrewd import data, decide
 from shrewd.calibrate import (
     Calibrator,
     brier_decomposition,
@@ -40,6 +42,8 @@ MIN_CALIBRATION_ROWS = 60
 MIN_MINORITY_ROWS = 12
 STACK_MARGIN = 0.02      # macro-F1 the stack must gain on gold dev to be kept
 REVIEW_FLOOR = 0.6       # a teacher answer below this lands in needs_review.csv
+AUDIT_SHARE = 0.05
+SPLIT_SETTLED = 0.9
 MIN_GATE_ROWS = 40       # fewer gold dev rows than this and the gate abstains
 MIN_RESOLUTION_SHARE = 0.03  # below this a Choice or Score head is ~AUROC 0.6 on a balanced split
 
@@ -548,9 +552,11 @@ class DecisionStudent:
 
         keys = [k for k in self.heads if k in targets]
         proba = self.predict_proba(list(texts), questions=keys)
-        _, stats = pick_threshold(doc_scores(proba), doc_disagree(proba, targets, keys),
-                                  budget, delta)
+        scores, disagree = doc_scores(proba), doc_disagree(proba, targets, keys)
+        _, stats = pick_threshold(scores, disagree, budget, delta)
         self.routing = {**stats, "questions": keys}
+        self._routing_held = {"scores": [round(float(s), 6) for s in scores],
+                              "disagree": [bool(d) for d in disagree]}
         return self
 
     # -- persistence -----------------------------------------------------------
@@ -592,6 +598,11 @@ class DecisionStudent:
                 indent=2,
             )
         )
+        held = getattr(self, "_routing_held", None)
+        if held is not None:
+            from shrewd.route import HELD_FILE
+
+            (path / HELD_FILE).write_text(json.dumps(held))
 
     @classmethod
     def _load(cls, path, meta):
@@ -745,6 +756,20 @@ class DecisionResult:
                     f"{name:{width}} {s['type']:7} {who[:7]:>7} "
                     f"{s['ece']:>7.3f} {s['brier']:>7.3f} {_share(s):>7}  {headline}"
                 )
+        if m.get("teachers"):
+            from shrewd.agree import short_name
+
+            names = [short_name(t) for t in m["teachers"]]
+            cell = max(14, *(len(n) for n in names)) + 2
+            lines += ["", "each teacher alone on the same test documents (the row above is "
+                          "their combination)",
+                      f"{'question':{width}} " + "".join(f"{n:>{cell}}" for n in names)]
+            for key in keys:
+                row = [(m["teachers"][t].get(key) or {}) for t in m["teachers"]]
+                if not any(s.get("n") for s in row):
+                    continue
+                lines.append(f"{key:{width}} " + "".join(
+                    f"{_headline(s) if s.get('n') else 'n/a':>{cell}}" for s in row))
         if m.get("uncalibrated"):
             lines += [
                 "",
@@ -900,6 +925,30 @@ def decision_findings(metrics):
 # ---------------------------------------------------------------- the project
 
 
+def _write_teacher_check(project, agreement, cost):
+    from shrewd.agree import short_name
+
+    summary = agreement.summary()
+    summary["disagreements"] = agreement.gold_disagreements()
+    (project.dir / "teacher_check.json").write_text(json.dumps(summary, indent=2))
+    project._record_stage("check_teachers", cost, teachers=len(agreement.teachers))
+    print(f"checked {len(agreement.teachers)} teacher(s) on {summary['n_dev']} dev documents "
+          f"for ${cost:.2f}")
+    for key, entry in summary["questions"].items():
+        accuracy = entry["dev_accuracy"]
+        shown = "  ".join(f"{short_name(m)} {accuracy[m]:.2f}" for m in agreement.teachers
+                          if m in accuracy)
+        if len(agreement.teachers) > 1 and "combined" in accuracy:
+            shown += f"  combined {accuracy['combined']:.2f}"
+        gap = summary["disagreements"][key]
+        tail = ""
+        if gap["pairs"]:
+            first = gap["pairs"][0]
+            tail = f"; most often you said {first['yours']} and they said {first['theirs']}"
+        print(f"  {key}: {shown}{tail}")
+    return summary
+
+
 def _backend_to_manifest(backend):
     """What to write down so the same teacher setup comes back on reload."""
     if backend is None:
@@ -919,6 +968,9 @@ def _backend_from_manifest(blob):
     return blob
 
 
+def _float_or_none(value):
+    value = float(value)
+    return None if np.isnan(value) else value
 
 class Decisions:
     """A panel of typed questions asked of one corpus.
@@ -926,6 +978,9 @@ class Decisions:
     Point it at a fresh directory with `questions` and `teacher` to start, or at an existing
     directory to resume. `teacher` is any litellm model string or a provider alias;
     `backend` decides how its probabilities are obtained (default: asked for in the reply).
+
+    `teacher` can also be a list of models. Their answers are combined per question,
+    weighted by how well each matched your dev labels.
     """
 
     def __init__(self, dir, questions=None, instructions=None, teacher=None,
@@ -935,7 +990,15 @@ class Decisions:
         self.dir = Path(dir)
         if questions is not None:
             decide.validate(questions)
-        if teacher is not None:
+        if isinstance(teacher, (list, tuple)):
+            teacher = [resolve_model(t) for t in teacher]
+            if len(set(teacher)) != len(teacher) or not teacher:
+                raise ValueError("teacher needs distinct models")
+            if len(teacher) == 1:
+                teacher = teacher[0]
+            elif getattr(backend, "name", None) == "ensemble":
+                raise ValueError("pass several teachers or an EnsembleBackend, not both")
+        elif teacher is not None:
             teacher = resolve_model(teacher)
         manifest_path = self.dir / "manifest.json"
         if manifest_path.exists():
@@ -984,6 +1047,7 @@ class Decisions:
             self.dir.mkdir(parents=True, exist_ok=True)
             self._save_manifest()
         self._cache_conn = None
+        self._agreement_fit = None
 
     def _save_manifest(self):
         import os
@@ -1017,6 +1081,99 @@ class Decisions:
         path = self.dir / "prompt_header.txt"
         return path.read_text() if path.exists() else None
 
+    def set_teacher(self, teacher):
+        """Change the teacher, or pass a list of several. Cached answers are kept."""
+        from shrewd.teacher import resolve_model
+
+        if isinstance(teacher, (list, tuple)):
+            teacher = [resolve_model(t) for t in teacher]
+            if not teacher or len(set(teacher)) != len(teacher):
+                raise ValueError("teacher needs distinct models")
+            if len(teacher) == 1:
+                teacher = teacher[0]
+            elif getattr(self.backend, "name", None) == "ensemble":
+                raise ValueError("pass several teachers or an EnsembleBackend, not both")
+        else:
+            teacher = resolve_model(teacher)
+        self.teacher = teacher
+        self._manifest["teacher"] = teacher
+        self._agreement_fit = None
+        self._record_stage("set_teacher", 0.0, teacher=teacher)
+
+    def check_teachers(self, dry_run=False):
+        """Have each teacher answer the dev split and report how often it matches your labels."""
+        dev_path = self.dir / "seed_dev.csv"
+        if not dev_path.exists():
+            raise FileNotFoundError("no seed data; call add_seed() first")
+        if dry_run:
+            from shrewd.teacher import estimate_calls
+
+            texts = pd.read_csv(dev_path)["text"].astype(str).tolist()
+            prompt = decide.build_prompt(self.questions, self.instructions, header=self._header())
+            n, cost = 0, 0.0
+            for model in self._teachers():
+                calls, price = estimate_calls(texts, prompt, model, 1, self._cache())
+                n += calls
+                cost = None if cost is None or price is None else cost + price
+            return {"uncached_calls": n, "estimated_usd": cost}
+        agreement, cost = self._agreement()
+        return _write_teacher_check(self, agreement, cost)
+
+    def _teachers(self):
+        return list(self.teacher) if isinstance(self.teacher, (list, tuple)) else [self.teacher]
+
+    def _several(self):
+        return len(self._teachers()) > 1
+
+    def _judge_each(self, texts, desc):
+        from shrewd.agree import short_name
+        from shrewd.judge import judge_texts
+
+        frames, total = [], 0.0
+        for model in self._teachers():
+            frame, cost = judge_texts(
+                texts, self.questions, model, instructions=self.instructions,
+                backend=self.backend, conn=self._cache(), desc=f"{desc} ({short_name(model)})",
+                header=self._header(),
+            )
+            frames.append(frame)
+            total += cost
+        return frames, total
+
+    def _judge(self, texts, desc):
+        if not self._several():
+            from shrewd.judge import judge_texts
+
+            frame, cost = judge_texts(
+                texts, self.questions, self.teacher, instructions=self.instructions,
+                backend=self.backend, conn=self._cache(), desc=desc, header=self._header(),
+            )
+            return frame, None, cost
+        frames, cost = self._judge_each(texts, desc)
+        agreement, dev_cost = self._agreement()
+        return agreement.combine(frames, texts), frames, cost + dev_cost
+
+    def _agreement(self):
+        from shrewd.agree import Agreement
+
+        header = self._header()
+        if self._agreement_fit is not None and self._agreement_fit[0] == header:
+            return self._agreement_fit[1], 0.0
+        dev_path = self.dir / "seed_dev.csv"
+        if not dev_path.exists():
+            raise FileNotFoundError(
+                "several teachers are combined by how well each matches your labels on the "
+                "dev split; call add_seed() first"
+            )
+        dev = pd.read_csv(dev_path)
+        dev["text"] = dev["text"].astype(str)
+        frames, cost = self._judge_each(dev["text"].tolist(), "teachers on dev")
+        agreement = Agreement(self.questions, self._teachers(), seed=self.seed).fit(
+            frames, dev["text"].tolist(), gold_frame(dev, self.questions)
+        )
+        self._agreement_fit = (header, agreement)
+        return agreement, cost
+
     def optimize(self, budget=800, target=None, reflection_model=None, overwrite=False,
                  max_header_words=None):
         """GEPA-optimize the prompt header against the dev split. Never sees the test set.
@@ -1038,11 +1195,14 @@ class Decisions:
             raise FileNotFoundError("no seed data; call add_seed() first")
         dev = pd.read_csv(dev_path)
         dev["text"] = dev["text"].astype(str)
-        reflection = resolve_model(reflection_model) if reflection_model else self.teacher
+        primary = self._teachers()[0]
+        if self._several():
+            print(f"several teachers configured; optimizing the header against {primary}")
+        reflection = resolve_model(reflection_model) if reflection_model else primary
         print(f"optimizing the prompt header with GEPA: budget {budget} teacher calls over "
               f"{len(dev)} dev rows, objective 1 - Brier/2")
         header, log, cost = run_gepa_decisions(
-            dev, self.questions, decide.default_header(self.instructions), self.teacher,
+            dev, self.questions, decide.default_header(self.instructions), primary,
             budget, target, reflection, self._cache(), self.seed,
             max_header_words=max_header_words,
         )
@@ -1122,12 +1282,219 @@ class Decisions:
         print(f"seed: {len(dev)} dev / {len(test)} test documents, "
               f"{len(self.questions)} questions")
 
-    def judge(self, df, dry_run=False, concurrency=8, overwrite=False):
+    def set_question(self, key, question):
+        """Add a question or change one. Run judge(overwrite=True) afterwards; answers to the
+        other questions come from the cache.
+        """
+        decide.validate({key: question})
+        old = self.questions.get(key)
+        if old is not None and decide.to_dict(old) == decide.to_dict(question):
+            return False
+        self.questions = {**self.questions, key: question}
+        self._manifest["questions"] = {k: decide.to_dict(q) for k, q in self.questions.items()}
+        self._agreement_fit = None
+        bad = 0
+        for name in ("seed_dev.csv", "seed_test.csv"):
+            path = self.dir / name
+            if path.exists():
+                seed = pd.read_csv(path, dtype=str, keep_default_na=False)
+                if key in seed.columns:
+                    answered = seed[key].str.strip() != ""
+                    bad += sum(gold_index(question, v) is None for v in seed.loc[answered, key])
+        if bad:
+            warnings.warn(f"{bad} seed answers for {key!r} don't fit the new options; fix "
+                          "them with fix_example() or they're left out of scoring",
+                          stacklevel=2)
+        self._record_stage("set_question", 0.0, question=key, added=old is None)
+        return True
+
+    def remove_question(self, key):
+        """Remove a question from your examples, the judged pool and the review files."""
+        if key not in self.questions:
+            raise ValueError(f"{key!r} is not a question in this panel")
+        if len(self.questions) == 1:
+            raise ValueError("a panel needs at least one question")
+        self.questions = {k: q for k, q in self.questions.items() if k != key}
+        self._manifest["questions"] = {k: decide.to_dict(q) for k, q in self.questions.items()}
+        self._agreement_fit = None
+        if (self.dir / "seed_test.csv").exists():
+            dev, test = self._seed_frames()
+            self._save_seed(dev.drop(columns=[key], errors="ignore"),
+                            test.drop(columns=[key], errors="ignore"))
+        for name in ("pool_judged.csv", "votes_pool.csv"):
+            path = self.dir / name
+            if path.exists():
+                frame = pd.read_csv(path)
+                frame.drop(columns=[c for c in frame.columns if c.startswith(f"{key}__")]
+                           ).to_csv(path, index=False)
+        for name in ("needs_review.csv", "reviewed.csv"):
+            path = self.dir / name
+            if path.exists():
+                frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+                if "question" in frame.columns:
+                    frame[frame["question"] != key].to_csv(path, index=False)
+        agreement = self.dir / "agreement.json"
+        if agreement.exists():
+            blob = json.loads(agreement.read_text())
+            if isinstance(blob, dict) and isinstance(blob.get("questions"), dict):
+                blob["questions"].pop(key, None)
+                agreement.write_text(json.dumps(blob, indent=2))
+        self._warn_stale(f"removed {key!r}")
+        self._record_stage("remove_question", 0.0, question=key)
+        return True
+
+    def merge_options(self, key, mapping):
+        """Merge options of a choice question into others, e.g. `{"other": "none"}`."""
+        question = self.questions.get(key)
+        if question is None:
+            raise ValueError(f"{key!r} is not a question in this panel")
+        if question.kind != "choice":
+            raise ValueError("only a choice question's options can be merged")
+        mapping = {str(source): str(target) for source, target in mapping.items()}
+        options = question.options()
+        for source, target in mapping.items():
+            if source not in options:
+                raise ValueError(f"{source!r} is not an option of {key!r}")
+            if target not in options or target in mapping:
+                raise ValueError(f"{source!r} must merge into an option that stays, not {target!r}")
+        if not mapping:
+            return False
+        if len(options) - len(mapping) < 2:
+            raise ValueError("a choice question needs at least two options")
+        merged = dataclasses.replace(question, criteria={
+            o: d for o, d in question.criteria.items() if o not in mapping})
+        self.questions = {**self.questions, key: merged}
+        self._manifest["questions"] = {k: decide.to_dict(q) for k, q in self.questions.items()}
+        self._agreement_fit = None
+        rename = lambda v: mapping.get(v, v)  # noqa: E731
+        if (self.dir / "seed_test.csv").exists():
+            dev, test = self._seed_frames()
+            for frame in (dev, test):
+                if key in frame.columns:
+                    frame[key] = frame[key].map(lambda v: rename(v) if isinstance(v, str) else v)
+            self._save_seed(dev, test)
+        for name in ("pool_judged.csv", "votes_pool.csv"):
+            path = self.dir / name
+            if path.exists():
+                frame = pd.read_csv(path)
+                for source, target in mapping.items():
+                    src, dst = f"{key}__{source}", f"{key}__{target}"
+                    if src in frame.columns and dst in frame.columns:
+                        frame[dst] = frame[dst] + frame[src]
+                        frame = frame.drop(columns=src)
+                frame.to_csv(path, index=False)
+        for name, columns in (("needs_review.csv", ("teacher_answer", "human_answer")),
+                              ("reviewed.csv", ("answer",))):
+            path = self.dir / name
+            if path.exists():
+                frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+                if "question" in frame.columns:
+                    rows = frame["question"] == key
+                    for column in columns:
+                        if column in frame.columns:
+                            frame.loc[rows, column] = frame.loc[rows, column].map(rename)
+                    frame.to_csv(path, index=False)
+        self._warn_stale(f"merged on {key!r}")
+        self._record_stage("merge_options", 0.0, question=key, mapping=mapping)
+        return True
+
+    def _warn_stale(self, what):
+        if (self.dir / "student").exists() or (self.dir / "candidates").exists():
+            warnings.warn(f"trained models still reflect the options you {what}; compare() or "
+                          "distill() again to retrain them", stacklevel=3)
+
+    def add_examples(self, df, test_frac=None):
+        """Add hand-answered documents to the existing split. Each one goes to the test set with
+        probability `test_frac`, decided by its text. Returns the (dev, test) counts added.
+        """
+        from shrewd.project import _hash_unit, _last_test_frac
+
+        dev, test = self._seed_frames()
+        frame = df.copy()
+        frame["text"] = frame["text"].astype(str)
+        frame = frame[frame["text"].str.strip() != ""].drop_duplicates("text")
+        frame = frame[~frame["text"].isin(set(dev["text"]) | set(test["text"]))]
+        for key in self.questions:
+            if key not in frame.columns:
+                frame[key] = ""
+        frame = frame[["text", *self.questions]]
+        frac = test_frac if test_frac is not None else _last_test_frac(self._manifest)
+        to_test = np.array([_hash_unit(t, self.seed) < frac for t in frame["text"]], dtype=bool)
+        dev = pd.concat([dev, frame[~to_test]], ignore_index=True)
+        test = pd.concat([test, frame[to_test]], ignore_index=True)
+        self._save_seed(dev, test)
+        added = (int((~to_test).sum()), int(to_test.sum()))
+        self._record_stage("add_examples", 0.0, dev=added[0], test=added[1])
+        print(f"added {added[0]} tuning and {added[1]} test documents")
+        return added
+
+    def fix_example(self, text, answers):
+        """Change the hand answers on one example. `answers` maps question ids to answers
+        ("" clears one).
+        """
+        for key, value in answers.items():
+            if key not in self.questions:
+                raise ValueError(f"{key!r} is not a question in this panel")
+            if str(value).strip() and gold_index(self.questions[key], value) is None:
+                raise ValueError(f"{key}: {value!r} is not one of "
+                                 f"{self.questions[key].options()}")
+        dev, test = self._seed_frames()
+        for frame, split in ((dev, "dev"), (test, "test")):
+            hit = frame["text"] == text
+            if hit.any():
+                for key, value in answers.items():
+                    if key not in frame.columns:
+                        frame[key] = ""
+                    frame.loc[hit, key] = str(value)
+                self._save_seed(dev, test)
+                self._record_stage("fix_example", 0.0, split=split, questions=sorted(answers))
+                return split
+        raise ValueError(f"{text[:40]!r} is not one of the seed documents")
+
+    def remove_examples(self, texts):
+        """Remove documents from your examples, in either split. Returns the (dev, test) counts
+        removed.
+        """
+        texts = {texts} if isinstance(texts, str) else {str(t) for t in texts}
+        dev, test = self._seed_frames()
+        gone = (int(dev["text"].isin(texts).sum()), int(test["text"].isin(texts).sum()))
+        if not any(gone):
+            return gone
+        self._save_seed(dev[~dev["text"].isin(texts)], test[~test["text"].isin(texts)])
+        self._record_stage("remove_examples", 0.0, dev=gone[0], test=gone[1])
+        if gone[1]:
+            warnings.warn(f"{gone[1]} test example(s) removed; test scores from before aren't "
+                          "comparable with the next distill()'s", stacklevel=2)
+        return gone
+
+    def _seed_frames(self):
+        if not (self.dir / "seed_test.csv").exists():
+            raise FileNotFoundError("no seed data; call add_seed() first")
+        frames = []
+        for name in ("seed_dev.csv", "seed_test.csv"):
+            frame = pd.read_csv(self.dir / name, dtype=str, keep_default_na=False)
+            frames.append(frame)
+        return tuple(frames)
+
+    def _save_seed(self, dev, test):
+        dev.to_csv(self.dir / "seed_dev.csv", index=False)
+        test.to_csv(self.dir / "seed_test.csv", index=False)
+        self._manifest["splits"] = {**self._manifest.get("splits", {}),
+                                    "n_dev": len(dev), "n_test": len(test)}
+        self._agreement_fit = None
+        self._save_manifest()
+
+    def judge(self, df, dry_run=False, concurrency=8, overwrite=False, escalate=None,
+              escalate_delta=0.05):
         """Have the teacher answer every question about every pooled document.
 
         One call per document covers the whole panel, which is where the saving is: the
         document is the expensive part of the prompt and asking N questions separately
         pays for it N times.
+
+        With several teachers, `escalate=0.05` asks the first teacher about every document and
+        the others only where its answer might be overruled, so that at most 5% of answers differ
+        from the full panel's, with probability 1 - `escalate_delta`.
         """
         from shrewd.judge import judge_texts
         from shrewd.teacher import estimate_calls
@@ -1148,11 +1515,25 @@ class Decisions:
         texts = [t for t in dict.fromkeys(texts) if t not in seen]
         prompt = decide.build_prompt(self.questions, self.instructions, header=self._header())
         if dry_run:
-            n, cost = estimate_calls(texts, prompt, self.teacher, 1, self._cache())
+            n, cost = 0, 0.0
+            to_price = texts
+            if self._several() and (self.dir / "seed_dev.csv").exists():
+                to_price = texts + pd.read_csv(self.dir / "seed_dev.csv")["text"].astype(
+                    str).tolist()
+            for model in self._teachers():
+                calls, price = estimate_calls(to_price, prompt, model, 1, self._cache())
+                n += calls
+                cost = None if cost is None or price is None else cost + price
             per = f"${cost:.2f}" if cost is not None else "unknown"
-            print(f"dry run: {n} uncached calls for {len(texts)} documents × "
+            teachers = f" × {len(self._teachers())} teachers (and the dev split)" \
+                if self._several() else ""
+            print(f"dry run: {n} uncached calls for {len(texts)} documents{teachers} × "
                   f"{len(self.questions)} questions, about {per}")
             return None
+        if self._several():
+            return self._judge_several(texts, out_path, escalate, escalate_delta)
+        if escalate is not None:
+            raise ValueError("escalate needs several teachers: teacher=[cheap, strong, ...]")
         frame, cost = judge_texts(
             texts, self.questions, self.teacher, instructions=self.instructions,
             backend=self.backend, conn=self._cache(), concurrency=concurrency,
@@ -1169,6 +1550,233 @@ class Decisions:
             print(f"{len(review)} (document, question) pairs where the teacher was unsure "
                   f"are in needs_review.csv; edit pool_judged.csv to overrule it")
         return frame
+
+    def _first_scores(self, frame, texts):
+        from shrewd.route import doc_scores
+
+        by_text = frame.drop_duplicates("text").set_index("text").reindex(texts)
+        return doc_scores({
+            key: np.nan_to_num(by_text[[f"{key}__{o}" for o in q.options()]].to_numpy(
+                dtype=float), nan=0.0)
+            for key, q in self.questions.items()
+        })
+
+    def _escalation_cutoff(self, agreement, budget, delta):
+        from shrewd.route import doc_disagree, pick_threshold
+
+        frames, texts, _ = agreement._dev
+        first = agreement.cross_fit_dev(only=[0])
+        full = agreement.cross_fit_dev()
+        alone, panel = {}, {}
+        for key, question in self.questions.items():
+            columns = [f"{key}__{o}" for o in question.options()]
+            alone[key] = np.nan_to_num(first[columns].to_numpy(dtype=float), nan=0.0)
+            panel[key] = np.nan_to_num(full[columns].to_numpy(dtype=float), nan=0.0)
+        return pick_threshold(self._first_scores(frames[0], texts),
+                              doc_disagree(alone, panel), budget=budget, delta=delta)
+
+    def _cascade_preview(self, agreement, budget=0.05, delta=0.05):
+        frames, texts, _ = agreement._dev
+        threshold, stats = self._escalation_cutoff(agreement, budget, delta)
+        scores = self._first_scores(frames[0], texts)
+        return {"first": self._teachers()[0], "budget": budget, "delta": delta,
+                "threshold": None if threshold == float("inf") else round(float(threshold), 6),
+                "escalate_share": round(float(np.mean(~(scores >= threshold))), 4),
+                "n_dev": stats.get("n")}
+
+    def _judge_several(self, texts, out_path, escalate=None, escalate_delta=0.05):
+        from shrewd.agree import pool_status, short_name, write_votes
+        from shrewd.judge import judge_texts
+
+        agreement, cost = self._agreement()
+        escalation = None
+        if escalate is None:
+            frames, pool_cost = self._judge_each(texts, "judging")
+            cost += pool_cost
+        else:
+            threshold, stats = self._escalation_cutoff(agreement, escalate, escalate_delta)
+            teachers = self._teachers()
+            first, first_cost = judge_texts(
+                texts, self.questions, teachers[0], instructions=self.instructions,
+                backend=self.backend, conn=self._cache(),
+                desc=f"judging ({short_name(teachers[0])})", header=self._header(),
+            )
+            cost += first_cost
+            scores = self._first_scores(first, texts)
+            hard = [t for t, s in zip(texts, scores, strict=True) if not s >= threshold]
+            frames = [first]
+            for model in teachers[1:]:
+                frame, more = judge_texts(
+                    hard, self.questions, model, instructions=self.instructions,
+                    backend=self.backend, conn=self._cache(),
+                    desc=f"escalated ({short_name(model)})", header=self._header(),
+                )
+                frames.append(frame)
+                cost += more
+            escalation = {"budget": escalate, "delta": escalate_delta,
+                          "threshold": None if threshold == float("inf") else threshold,
+                          "n_dev": stats.get("n"), "escalated": len(hard),
+                          "documents": len(texts)}
+            print(f"escalated {len(hard)} of {len(texts)} documents past "
+                  f"{short_name(teachers[0])} (at most {escalate:.0%} keep an answer the full "
+                  f"panel would change, {1 - escalate_delta:.0%} bound on "
+                  f"{stats.get('n')} dev documents)")
+        frame = self._reapply_reviewed(agreement.combine(frames, texts))
+        frame.to_csv(out_path, index=False)
+        write_votes(self.dir / "votes_pool.csv", self._teachers(), frames)
+        summary = agreement.summary(frames, texts, floor=REVIEW_FLOOR)
+        if escalation:
+            summary["escalation"] = escalation
+        summary["cascade"] = self._cascade_preview(agreement)
+        (self.dir / "agreement.json").write_text(json.dumps(summary, indent=2))
+        status = pool_status(agreement, frames, texts, floor=REVIEW_FLOOR)
+        review = self._several_review_queue(frame, frames, status["cells"])
+        review.to_csv(self.dir / "needs_review.csv", index=False)
+        self._record_stage("judge", cost, n_documents=len(texts),
+                           teachers=len(self._teachers()),
+                           escalated=escalation["escalated"] if escalation else None)
+        counts = status["summary"]
+        print(f"judged {len(texts)} documents × {len(self.questions)} questions with "
+              f"{len(self._teachers())} teachers for ${cost:.2f}")
+        print(f"teachers agree on {counts['agree']} documents, split on {counts['split']}, "
+              f"unsure on {counts['unsure']}, missing an answer on {counts['missing']}")
+        for key, entry in summary["questions"].items():
+            accuracy = entry["dev_accuracy"]
+            shown = "  ".join(f"{short_name(m)} {accuracy[m]:.2f}" for m in self._teachers()
+                              if m in accuracy)
+            if "combined" in accuracy:
+                shown += f"  combined {accuracy['combined']:.2f}"
+            print(f"  {key}: dev accuracy {shown} ({entry['method']})")
+        if len(review):
+            print(f"{len(review)} (document, question) pairs to look at are in "
+                  f"needs_review.csv, most useful first; fill in human_answer to overrule")
+        return frame
+
+    def _several_review_queue(self, frame, frames, cells, floor=REVIEW_FLOOR):
+        from shrewd.agree import short_name
+
+        ledger_path = self.dir / "reviewed.csv"
+        done = set()
+        if ledger_path.exists():
+            ledger = pd.read_csv(ledger_path, dtype=str)
+            done = set(zip(ledger["text"], ledger["question"], strict=True))
+        names = [short_name(m) for m in self._teachers()]
+        by_text = [f.drop_duplicates("text").set_index("text") for f in frames]
+        rows, settled = [], []
+        for _, row in frame.iterrows():
+            text = row["text"]
+            for key, question in self.questions.items():
+                if (text, key) in done:
+                    continue
+                options = question.options()
+                columns = [f"{key}__{o}" for o in options]
+                probs = row[columns].to_numpy(dtype=float)
+                said = []
+                for name, table in zip(names, by_text, strict=True):
+                    if text not in table.index:
+                        continue
+                    values = table.loc[text, columns].to_numpy(dtype=float)
+                    if np.isnan(values).any():
+                        said.append((name, None, None))
+                    else:
+                        top = int(values.argmax())
+                        said.append((name, options[top], float(values[top])))
+                teachers = "; ".join(f"{n}: {o} {p:.2f}" if o is not None else f"{n}: no answer"
+                                     for n, o, p in said)
+                state = cells.get((text, key), "agree")
+                entry = {"text": text, "question": key, "teacher_answer": None,
+                         "teacher_prob": None, "why": "", "teachers": teachers,
+                         "human_answer": ""}
+                if np.isnan(probs).any():
+                    entry["why"] = "no usable answer"
+                    rows.append(entry)
+                    continue
+                top = int(probs.argmax())
+                entry["teacher_answer"] = options[top]
+                entry["teacher_prob"] = round(float(probs[top]), 3)
+                if state == "split" and probs[top] < SPLIT_SETTLED:
+                    entry["why"] = "teachers split"
+                elif state == "missing":
+                    entry["why"] = "no answer from " + ", ".join(
+                        n for n, o, _ in said if o is None)
+                elif probs[top] < floor:
+                    runner = int(np.argsort(probs)[-2])
+                    entry["why"] = (f"unsure: {options[top]} {probs[top]:.2f} vs "
+                                    f"{options[runner]} {probs[runner]:.2f}")
+                else:
+                    entry["why"] = "spot check: settled"
+                    settled.append(entry)
+                    continue
+                rows.append(entry)
+        columns = ["text", "question", "teacher_answer", "teacher_prob", "why", "teachers",
+                   "human_answer"]
+        queue = pd.DataFrame(rows, columns=columns)
+        queue = queue.sort_values("teacher_prob", na_position="first").reset_index(drop=True)
+        n_audit = min(len(settled), int(round(AUDIT_SHARE * len(queue))))
+        if n_audit:
+            rng = np.random.default_rng(self.seed)
+            picks = [settled[i] for i in sorted(rng.choice(len(settled), n_audit, replace=False))]
+            out, every = [], max(1, len(queue) // n_audit)
+            for i, record in enumerate(queue.to_dict("records")):
+                out.append(record)
+                if (i + 1) % every == 0 and picks:
+                    out.append(picks.pop(0))
+            out += picks
+            queue = pd.DataFrame(out, columns=columns)
+        return queue
+
+    def compare(self, features=("tfidf", "embed"), soft=True):
+        """Train one student per featurization on the judged pool and score each on the dev split.
+        The test set isn't used. Each is saved under candidates/<name>/ and listed in
+        compare.json. `features` takes the same values as distill().
+        """
+        pool = pd.read_csv(self.dir / "pool_judged.csv")
+        dev = pd.read_csv(self.dir / "seed_dev.csv")
+        for frame in (pool, dev):
+            frame["text"] = frame["text"].astype(str)
+        pool_targets = self._targets_from_pool(pool)
+        dev_gold = gold_frame(dev, self.questions)
+        dev_texts = dev["text"].tolist()
+
+        rows = []
+        for entry in features:
+            student = DecisionStudent(self.questions, features=entry, seed=self.seed, soft=soft,
+                                      instructions=self.instructions)
+            base = name = student.features_kind
+            n = 2
+            while any(r["features"] == name for r in rows):
+                name = f"{base}-{n}"
+                n += 1
+            print(f"training candidate {name} on {len(pool)} judged documents")
+            student.fit(pool["text"].tolist(), pool_targets)
+            candidate_dir = self.dir / "candidates" / name
+            shutil.rmtree(candidate_dir, ignore_errors=True)
+            student.save(candidate_dir)
+            student.predict_proba(dev_texts[:1], calibrated=False)
+            started = time.perf_counter()
+            proba = student.predict_proba(dev_texts, calibrated=False)
+            ms_per_item = (time.perf_counter() - started) * 1000 / max(1, len(dev_texts))
+            per_question = {}
+            for j, key in enumerate(self.questions):
+                answered = np.where(dev_gold[:, j] >= 0)[0]
+                if key in proba and len(answered):
+                    hits = proba[key][answered].argmax(axis=1) == dev_gold[answered, j]
+                    per_question[key] = {"dev_accuracy": round(float(hits.mean()), 3),
+                                         "n": int(len(answered))}
+            size = sum(f.stat().st_size for f in candidate_dir.rglob("*") if f.is_file())
+            rows.append({"features": name, "questions": per_question,
+                         "ms_per_item": round(ms_per_item, 2), "size_mb": round(size / 1e6, 1)})
+
+        width = max(len(r["features"]) for r in rows) + 2
+        keys = list(self.questions)
+        print(f"\n{'candidate':{width}}" + "".join(f"  {k[:10]:>10}" for k in keys) + "  ms/item")
+        for r in rows:
+            scores = [r["questions"].get(k, {}).get("dev_accuracy", float("nan")) for k in keys]
+            cells = "".join(f"  {v:>10.3f}" for v in scores)
+            print(f"{r['features']:{width}}{cells}  {r['ms_per_item']:>7.2f}")
+        (self.dir / "compare.json").write_text(json.dumps({"candidates": rows}, indent=2))
+        self._record_stage("compare", 0.0, features=[r["features"] for r in rows], soft=soft)
+        return rows
 
     def distill(self, features="auto", soft=True, calibration="auto",
                 calibrate_teacher=False, zero_shot=False, stack_margin=STACK_MARGIN,
@@ -1196,8 +1804,6 @@ class Decisions:
         this pays off from about a thousand judged documents. The report also checks the
         locally answered test documents against the human labels.
         """
-        from shrewd.judge import judge_texts
-
         self.apply_review()
         ledger = self.dir / "reviewed.csv"
         # what the report shows is every human answer in effect, not just the ones
@@ -1268,11 +1874,7 @@ class Decisions:
         student.save(self.dir / "student")
 
         after = self._score_all(student, test, calibrated=True)
-        teacher_frame, cost = judge_texts(
-            test["text"].tolist(), self.questions, self.teacher,
-            instructions=self.instructions, backend=self.backend, conn=self._cache(),
-            desc="teacher on test", header=self._header(),
-        )
+        teacher_frame, frames, cost = self._judge(test["text"].tolist(), "teacher on test")
         teacher_scores = self._score_teacher(teacher_frame, test)
 
         test_gold = gold_frame(test, self.questions)
@@ -1300,6 +1902,11 @@ class Decisions:
                 float(np.mean([after[k]["ece"] for k in scored])), 4)
         if teacher_cals:
             metrics["teacher_calibration"] = {k: c.to_dict() for k, c in teacher_cals.items()}
+        if frames is not None:
+            metrics["teachers"] = {
+                model: self._score_teacher(frame, test)
+                for model, frame in zip(self._teachers(), frames, strict=True)
+            }
         if student.stack_report:
             metrics["stacking"] = student.stack_report
         if student.routing:
@@ -1344,17 +1951,13 @@ class Decisions:
     def ask(self, texts):
         """The teacher's answers, as answer maps in the same shape as `decide()` gives. Pass it
         as `decide(texts, fallback=d.ask)` to send what the student is unsure of to the
-        teacher. Answers are cached like `judge()`'s."""
-        from shrewd.judge import judge_texts
-
+        teacher. Answers are cached like `judge()`'s. With several teachers, it's their
+        combined answer.
+        """
         single = isinstance(texts, str)
         texts = [texts] if single else list(texts)
-        frame, _ = judge_texts(
-            texts, self.questions, self.teacher, instructions=self.instructions,
-            backend=self.backend, conn=self._cache(), desc="teacher fallback",
-            header=self._header(),
-        )
-        frame = frame.set_index("text").reindex(texts)
+        frame, _, _ = self._judge(texts, "teacher fallback")
+        frame = frame.drop_duplicates("text").set_index("text").reindex(texts)
         rows = []
         for i in range(len(texts)):
             row = {}
@@ -1409,7 +2012,10 @@ class Decisions:
         from shrewd.judge import judge_texts
 
         path = self.dir / "dev_judged.csv"
-        if path.exists():
+        if self._several():
+            agreement, cost = self._agreement()
+            frame = agreement.cross_fit_dev()
+        elif path.exists():
             frame, cost = pd.read_csv(path), 0.0
         else:
             frame, cost = judge_texts(
@@ -1454,12 +2060,43 @@ class Decisions:
         fixes = review[review["human_answer"].str.strip() != ""]
         if fixes.empty:
             return 0
+        return self._apply_answers([
+            {"text": row["text"], "question": row["question"], "answer": row["human_answer"]}
+            for _, row in fixes.iterrows()
+        ])
+
+    def review(self, answers):
+        """Record your answers on pool documents, as filling in needs_review.csv and calling
+        apply_review() would.
+        """
+        if not (self.dir / "pool_judged.csv").exists():
+            raise FileNotFoundError("no pool_judged.csv; run judge() on your pool first")
+        records = answers.to_dict("records") if isinstance(answers, pd.DataFrame) \
+            else list(answers)
+        applied = self._apply_answers(records)
+        path, ledger_path = self.dir / "needs_review.csv", self.dir / "reviewed.csv"
+        if applied and path.exists() and ledger_path.exists():
+            queue = pd.read_csv(path, dtype=str, keep_default_na=False)
+            ledger = pd.read_csv(ledger_path, dtype=str)
+            done = set(zip(ledger["text"], ledger["question"], strict=True))
+            keep = [(t, q) not in done for t, q in zip(queue["text"], queue["question"],
+                                                        strict=True)]
+            queue[keep].to_csv(path, index=False)
+        return applied
+
+    def _apply_answers(self, records):
+        pool_path = self.dir / "pool_judged.csv"
         pool = pd.read_csv(pool_path)
         pool["text"] = pool["text"].astype(str)
         index = {t: i for i, t in enumerate(pool["text"])}
+        ledgered = set()
+        if (self.dir / "reviewed.csv").exists():
+            old = pd.read_csv(self.dir / "reviewed.csv", dtype=str)
+            ledgered = set(zip(old["text"], old["question"], strict=True))
+        before = data.read_before(self.dir)
         applied, rejected = [], []
-        for _, row in fixes.iterrows():
-            key, answer, text = row["question"], row["human_answer"].strip(), row["text"]
+        for row in records:
+            key, answer, text = row["question"], str(row["answer"]).strip(), str(row["text"])
             question = self.questions.get(key)
             if question is None:
                 rejected.append(f"{key!r} is not a question in this panel")
@@ -1471,11 +2108,16 @@ class Decisions:
             if g is None:
                 rejected.append(f"{key}: {answer!r} is not one of {question.options()}")
                 continue
+            if (text, key) not in ledgered and key not in before.get(text, {}):
+                before.setdefault(text, {})[key] = [
+                    _float_or_none(pool.at[index[text], f"{key}__{o}"])
+                    for o in question.options()]
             for j, option in enumerate(question.options()):
                 pool.loc[index[text], f"{key}__{option}"] = 1.0 if j == g else 0.0
             applied.append({"text": text, "question": key, "answer": question.options()[g]})
         if applied:
             pool.to_csv(pool_path, index=False)
+            data.write_before(self.dir, before)
             ledger_path = self.dir / "reviewed.csv"
             ledger = pd.DataFrame(applied)
             if ledger_path.exists():
@@ -1501,6 +2143,7 @@ class Decisions:
         frame = frame.copy()
         frame["text"] = frame["text"].astype(str)
         index = {t: i for i, t in enumerate(frame["text"])}
+        before = data.read_before(self.dir)
         n = 0
         for _, row in ledger.iterrows():
             question = self.questions.get(row["question"])
@@ -1510,12 +2153,65 @@ class Decisions:
             if g is None:
                 continue
             i = index[row["text"]]
+            before.setdefault(row["text"], {})[row["question"]] = [
+                _float_or_none(frame.at[i, f"{row['question']}__{o}"]) for o in question.options()]
             for j, option in enumerate(question.options()):
                 frame.loc[i, f"{row['question']}__{option}"] = 1.0 if j == g else 0.0
             n += 1
         if n:
+            data.write_before(self.dir, before)
             print(f"re-applied {n} human answers from reviewed.csv")
         return frame
+
+    def unreview(self, texts, questions=None):
+        """Undo review() on pool documents, for every question or only `questions`. The teachers'
+        answers come back.
+        """
+        texts = [texts] if isinstance(texts, str) else [str(t) for t in texts]
+        ledger_path, pool_path = self.dir / "reviewed.csv", self.dir / "pool_judged.csv"
+        if not ledger_path.exists() or not pool_path.exists():
+            return 0
+        ledger = pd.read_csv(ledger_path, dtype=str)
+        wanted = set(texts)
+        hit = ledger["text"].isin(wanted) & (
+            ledger["question"].isin(list(questions)) if questions is not None else True)
+        back = [(t, q) for t, q in zip(ledger.loc[hit, "text"], ledger.loc[hit, "question"],
+                                       strict=True) if q in self.questions]
+        if not back:
+            return 0
+        before = data.read_before(self.dir)
+        values = {}
+        for text, key in back:
+            saved = before.get(text, {}).get(key)
+            if saved is not None and len(saved) == len(self.questions[key].options()):
+                values[(text, key)] = saved
+        missing = list(dict.fromkeys(t for t, q in back if (t, q) not in values))
+        cost = 0.0
+        if missing:
+            frame, _, cost = self._judge(missing, "teachers' answers")
+            frame = frame.drop_duplicates("text").set_index("text")
+            for text, key in back:
+                if (text, key) not in values:
+                    values[(text, key)] = [_float_or_none(frame.at[text, f"{key}__{o}"])
+                                           for o in self.questions[key].options()]
+        pool = pd.read_csv(pool_path)
+        pool["text"] = pool["text"].astype(str)
+        index = {t: i for i, t in enumerate(pool["text"])}
+        for (text, key), probs in values.items():
+            if text in index:
+                for option, p in zip(self.questions[key].options(), probs, strict=True):
+                    pool.loc[index[text], f"{key}__{option}"] = np.nan if p is None else p
+        pool.to_csv(pool_path, index=False)
+        rest = ledger[~hit]
+        if rest.empty:
+            ledger_path.unlink()
+        else:
+            rest.to_csv(ledger_path, index=False)
+        for text, key in back:
+            before.get(text, {}).pop(key, None)
+        data.write_before(self.dir, {t: v for t, v in before.items() if v})
+        self._record_stage("unreview", cost, items=len(back))
+        return len(back)
 
     def _review_queue(self, frame, floor=REVIEW_FLOOR):
         """The teacher's least confident answers, one row per (document, question): the file a

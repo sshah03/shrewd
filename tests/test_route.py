@@ -63,3 +63,43 @@ def test_the_guarantee_holds_on_fresh_draws():
         true = 0.0 if t == np.inf else 0.06 * (1 - t) ** 2
         broke += true > 0.02
     assert broke / 300 <= 0.08
+
+
+def test_the_limit_moves_without_retraining(tmp_path, decision_teacher):
+    import json
+
+    from conftest import QUESTIONS, make_docs
+
+    from shrewd import load
+    from shrewd.decisions import Decisions
+    from shrewd.route import curve, rebudget
+
+    docs = make_docs(900)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[:200], test_frac=0.4)
+    d.judge(docs.iloc[200:][["text"]])
+    d.distill(features="tfidf", route_budget=0.02)
+    points = curve(tmp_path / "p", budgets=(0.01, 0.05, 0.2))
+    coverage = [p["coverage"] for p in points]
+    assert coverage == sorted(coverage)                     # a looser limit answers more
+    stats = rebudget(tmp_path / "p", 0.2)
+    assert stats["budget"] == 0.2
+    meta = json.loads((tmp_path / "p" / "student" / "meta.json").read_text())
+    assert meta["routing"]["budget"] == 0.2 and meta["routing"]["questions"]
+    assert load(tmp_path / "p").routing["budget"] == 0.2
+
+
+def test_rebudget_says_what_to_do_without_held_scores(tmp_path, decision_teacher):
+    import pytest
+    from conftest import QUESTIONS, make_docs
+
+    from shrewd.decisions import Decisions
+    from shrewd.route import rebudget
+
+    docs = make_docs(200)
+    d = Decisions(tmp_path / "p", questions=QUESTIONS, teacher="test/fake-model")
+    d.add_seed(docs.iloc[:100], test_frac=0.4)
+    d.judge(docs.iloc[100:][["text"]])
+    d.distill(features="tfidf")
+    with pytest.raises(FileNotFoundError, match="route_budget"):
+        rebudget(tmp_path / "p", 0.05)
