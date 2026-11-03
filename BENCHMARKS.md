@@ -660,7 +660,7 @@ overrode the pick by hand after looking at scam texts, as noted in its row.
 
 | panel | source (Hub) | gold | tf-idf / embed | encoder | shipped |
 |---|---|---|---|---|---|
-| messages | ucirvine/sms_spam | unsolicited | 0.991 AUROC, ECE 0.004, 0.04 ms | **0.997, 0.002, 6.3 ms** | encoder (tied on gold, but on the README's parcel scam tf-idf says 0.64 "personal" and the encoder 0.94 "scam") |
+| messages | ucirvine/sms_spam | unsolicited | 0.991 AUROC, ECE 0.004, 0.04 ms | **0.997, 0.002, 6.3 ms** | encoder (tied on gold, but on the README's parcel scam tf-idf says 0.35 "personal" and the encoder 0.90 "scam") |
 | email | zefang-liu/phishing-email-dataset | spam | **0.993**, 0.010, 0.5 ms | not run (long emails, 1 h per fit) | tf-idf |
 | guardrail | lmsys/toxic-chat + safe-guard-prompt-injection + jackhhao/jailbreak | harmful / jailbreak / injection | **0.937 / 0.971 / 0.987**, 0.03 ms | 0.941 / 0.981 / 0.996, 72 ms | embed (won on gold test) |
 | pii | ai4privacy/pii-masking-200k | contact / identity / financial / credentials / device | 0.864 / 0.739 / 0.928 / 0.939 / 0.920, 0.09 ms | **0.941 / 0.921 / 0.963 / 0.965 / 0.995**, 9.4 ms | encoder |

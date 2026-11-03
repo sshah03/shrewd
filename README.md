@@ -35,7 +35,8 @@ d.judge(pd.read_csv("unlabeled.csv"))        # the LLM answers the rest, one cal
 print(d.distill(route_budget=0.02).report()) # train, calibrate, score against your labels
 
 dec = load("runs/tickets")
-dec.decide(tickets, fallback=d.ask)          # local where it's sure, the LLM for the rest
+dec.decide(tickets)                          # answered locally, no API calls
+dec.decide(tickets, fallback=d.ask)          # optional: the LLM answers what it's unsure of
 ```
 
 To see it run without an API key,
@@ -164,9 +165,11 @@ Options:
   split and weighs its votes by how often it matched your labels there.
 - **Check the teachers first.** `proj.check_teachers()` has each teacher label only your
   dev split, so you see how often each one matches you before paying for the pool.
-- **Send the unsure ones to the teacher.** `proj.distill(route_budget=0.02)` sets a
-  confidence threshold the same way decision panels do, and
-  `load(dir).predict(texts, fallback=proj.ask)` labels the rest with the teacher.
+- **Optionally, send the unsure ones to the teacher.** `proj.distill(route_budget=0.02)`
+  sets a confidence threshold the same way decision panels do, and
+  `load(dir).predict(texts, fallback=proj.ask)` labels the rest with the teacher. That only
+  works where the model runs through shrewd with the teacher's API key, and it holds part
+  of the pool out of training. Without it, the model answers everything itself.
 - **Resume long fine-tunes.** `distill(student="encoder", checkpoint_dir=...)` saves the
   training state after each epoch, so a stopped run picks up where it left off.
   `EncoderFeatures(checkpoint_dir=...)` does the same for panels. Off by default.
@@ -272,11 +275,12 @@ Options:
   each head and keeps it per question only where it beats the plain head on your hand-labeled
   dev split. It helped on sentiment and emotion and got rejected almost everywhere else.
   20-800 ms/doc.
-- **Send the unsure ones to the teacher.** `distill(route_budget=0.02)` picks a confidence
-  threshold so that at most 2% of requests get a local answer the teacher would disagree
-  with. Then `dec.decide(texts, fallback=d.ask)` answers the rest with the teacher, or
-  `route=True` leaves them as `None`. It needs about a thousand judged documents to be
-  worth it. Part 2 has the numbers.
+- **Optionally, send the unsure ones to the teacher.** `distill(route_budget=0.02)` picks a
+  confidence threshold so that at most 2% of requests get a local answer the teacher would
+  disagree with. Then `dec.decide(texts, fallback=d.ask)` answers the rest with the teacher,
+  or `route=True` leaves them as `None`. The fallback needs shrewd and the teacher's API key
+  where the model runs. It needs about a thousand judged documents to be worth it. Part 2
+  has the numbers.
 - **Use several teachers.** `teacher=["anthropic/claude-haiku-5-5", "openai/gpt-6-astra"]`
   has each answer every document, your dev split included, and combines them per question
   by how often each matched your labels. `d.check_teachers()` shows that before you pay for
@@ -317,14 +321,14 @@ pii.decide("my password is hunter2 and the PIN is 4471")
 #  'device': <Answer device noul=0.00>, 'share_risk': <Answer share_risk choice='high'>}
 
 sms = load(RELEASE + "panel-messages.tar.gz")
-sms.decide("URGENT: your parcel is held. Pay the £2.99 fee at http://royal-mail-fee.co to release it")
-# {'unsolicited': <Answer unsolicited noul=0.94>, 'kind': <Answer kind choice='scam'>,
-#  'asks_action': <Answer asks_action noul=0.94>, 'risk': <Answer risk score=2.7>}
+sms.decide("URGENT: your parcel is held. Pay the £2.99 fee to release it")
+# {'unsolicited': <Answer unsolicited noul=0.90>, 'kind': <Answer kind choice='scam'>,
+#  'asks_action': <Answer asks_action noul=0.76>, 'risk': <Answer risk score=1.9>}
 ```
 
 Those are real outputs on text none of the panels saw. They also show why `messages` ships
 the encoder even though the tf-idf student tied it on the labeled test split. The SMS corpus
-is from 2011, and on the parcel-payment scam above, the tf-idf head gives 0.64 and calls it
+is from 2011, and on the parcel-payment scam above, the tf-idf head gives 0.35 and calls it
 `personal`, while the encoder gets it right.
 
 `pii` has a known gap. Its training sentences write card numbers as unbroken 16-digit runs,
