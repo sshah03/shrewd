@@ -94,6 +94,7 @@ def test_a_tfidf_classifier_exports_and_matches(classifier_project, tmp_path):
     assert report["max_difference"] < 1e-6
     assert {"model.json", "weights.safetensors", "shrewd_model.py", "shrewd_model.js",
             "shrewd_model.d.ts", "README.md"} <= set(report["files"])
+    assert not (out / "__pycache__").exists()
     model, exported = shrewd.load(classifier_project), _runtime(out)
     assert exported.predict(TEXTS) == model.predict(TEXTS)
     assert exported.predict("I was charged twice") == model.predict(["I was charged twice"])[0]

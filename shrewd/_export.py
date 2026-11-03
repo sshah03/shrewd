@@ -631,11 +631,16 @@ def _check_texts(project_dir, limit=200):
 
 def _load_runtime(out_dir):
     import importlib.util
+    import sys
 
     path = out_dir / "shrewd_model.py"
     spec = importlib.util.spec_from_file_location("_shrewd_model_check", path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    before, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = before
     return module
 
 
