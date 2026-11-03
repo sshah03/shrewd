@@ -36,9 +36,13 @@ def _runtime(folder):
 
 
 def _node(folder, texts, call):
+    inputs = folder.parent / f"{folder.name}-texts.json"
+    inputs.write_text(json.dumps(texts), encoding="utf-8")
     script = (f'import {{ Model }} from "{(folder / "shrewd_model.js").as_posix()}";\n'
+              'import { readFileSync } from "node:fs";\n'
               f'const m = await Model.load("{folder.as_posix()}");\n'
-              f'console.log(JSON.stringify({json.dumps(texts)}.map((t) => m.{call}(t))));')
+              f'const texts = JSON.parse(readFileSync("{inputs.as_posix()}", "utf8"));\n'
+              f'console.log(JSON.stringify(texts.map((t) => m.{call}(t))));')
     return json.loads(subprocess.check_output(["node", "--input-type=module", "-e", script],
                                               text=True))
 
