@@ -468,7 +468,8 @@ class Project:
             if self._combine() == "weighted":
                 to_price = texts + data.read_csv(self.dir / "seed_dev.csv")["text"].tolist()
             for model in teachers:
-                calls, price = estimate_calls(to_price, prompt, model, votes, self._cache())
+                calls, price = estimate_calls(to_price, prompt, model, votes, self._cache(),
+                                              cached_prompt=True)
                 n_calls += calls
                 cost = None if cost is None or price is None else cost + price
             print(
@@ -612,7 +613,8 @@ class Project:
             texts = data.read_csv(self.dir / "seed_dev.csv")["text"].tolist()
             n_calls, cost = 0, 0.0
             for model in self._teachers():
-                calls, price = estimate_calls(texts, prompt, model, votes, self._cache())
+                calls, price = estimate_calls(texts, prompt, model, votes, self._cache(),
+                                              cached_prompt=True)
                 n_calls += calls
                 cost = None if cost is None or price is None else cost + price
             return {"uncached_calls": n_calls, "estimated_usd": cost}

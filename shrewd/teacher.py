@@ -252,11 +252,14 @@ def label_texts(texts, prompt, model, labels, votes=1, conn=None, concurrency=8,
     return pd.DataFrame(rows, columns=["text", "label", "confidence"]), total_cost
 
 
-def estimate_calls(texts, prompt, model, votes, conn):
+def estimate_calls(texts, prompt, model, votes, conn, cached_prompt=False):
     """Count not-yet-cached calls for a labeling run and roughly price them.
 
     Returns (n_uncached_calls, cost_usd_or_None). Cost is None when litellm has
     no price data for the model. Ignores correction retries since this is an estimate.
+    With `cached_prompt=True`, a long system prompt on an Anthropic model is priced as a
+    cached read after the first call, which is what those calls are billed. Spending caps
+    keep the full price, since the first calls of a run can miss the cache.
     """
     temperature = _temperature(votes)
     n = sum(
@@ -273,6 +276,30 @@ def estimate_calls(texts, prompt, model, votes, conn):
         input_cost, output_cost = litellm.cost_per_token(
             model=model, prompt_tokens=prompt_tokens, completion_tokens=12 * n
         )
-        return n, input_cost + output_cost
     except Exception:
         return n, None
+    cost = input_cost + output_cost
+    if cached_prompt:
+        cost = max(0.0, cost - _cache_saving(prompt, model, n))
+    return n, cost
+
+
+CACHE_MIN_TOKENS = 1024
+
+
+def _cache_saving(prompt, model, n):
+    tokens = len(prompt) / 4
+    if n < 2 or tokens < CACHE_MIN_TOKENS:
+        return 0.0
+    try:
+        if litellm.get_llm_provider(model)[1] != "anthropic":
+            return 0.0
+        info = litellm.get_model_info(model)
+        full, read = info.get("input_cost_per_token"), info.get("cache_read_input_token_cost")
+        prompt_usd, _ = litellm.cost_per_token(model=model, prompt_tokens=int(tokens * n),
+                                               completion_tokens=0)
+    except Exception:
+        return 0.0
+    if not (full and read and read < full):
+        return 0.0
+    return prompt_usd * (1 - read / full) * (n - 1) / n

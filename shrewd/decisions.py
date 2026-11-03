@@ -1112,7 +1112,8 @@ class Decisions:
             prompt = decide.build_prompt(self.questions, self.instructions, header=self._header())
             n, cost = 0, 0.0
             for model in self._teachers():
-                calls, price = estimate_calls(texts, prompt, model, 1, self._cache())
+                calls, price = estimate_calls(texts, prompt, model, 1, self._cache(),
+                                              cached_prompt=True)
                 n += calls
                 cost = None if cost is None or price is None else cost + price
             return {"uncached_calls": n, "estimated_usd": cost}
@@ -1521,7 +1522,8 @@ class Decisions:
                 to_price = texts + pd.read_csv(self.dir / "seed_dev.csv")["text"].astype(
                     str).tolist()
             for model in self._teachers():
-                calls, price = estimate_calls(to_price, prompt, model, 1, self._cache())
+                calls, price = estimate_calls(to_price, prompt, model, 1, self._cache(),
+                                              cached_prompt=True)
                 n += calls
                 cost = None if cost is None or price is None else cost + price
             per = f"${cost:.2f}" if cost is not None else "unknown"

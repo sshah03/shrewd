@@ -189,3 +189,52 @@ def test_empty_response_content(fake_teacher):
     label, _ = classify("x")
     assert label is None
     assert fake_teacher.calls == 2
+
+
+@pytest.fixture
+def priced(monkeypatch):
+    """A model at $1 per million input tokens, cached reads at a tenth of that."""
+    def cost_per_token(model, prompt_tokens, completion_tokens):
+        return prompt_tokens * 1e-6, completion_tokens * 5e-6
+
+    monkeypatch.setattr(litellm, "cost_per_token", cost_per_token)
+    monkeypatch.setattr(litellm, "get_model_info", lambda model: {
+        "input_cost_per_token": 1e-6, "cache_read_input_token_cost": 1e-7})
+    monkeypatch.setattr(litellm, "get_llm_provider",
+                        lambda model: (model, model.split("/")[0], None, None))
+
+
+def test_a_long_prompt_can_be_priced_as_cached_after_the_first_call(priced):
+    texts = [f"ticket {i}" for i in range(10)]
+    prompt = "x" * 8000                                         # about 2,000 tokens
+    _, full = teacher.estimate_calls(texts, prompt, "anthropic/claude-haiku-5-5", 1, None)
+    _, cached = teacher.estimate_calls(texts, prompt, "anthropic/claude-haiku-5-5", 1, None,
+                                       cached_prompt=True)
+    prompt_usd = 2000 * 10 * 1e-6
+    assert cached == pytest.approx(full - prompt_usd * 0.9 * 9 / 10)
+    haiku = "anthropic/claude-haiku-5-5"
+    for model, words, n in (("openai/gpt-6-luna", prompt, 10), (haiku, "short", 10),
+                            (haiku, prompt, 1)):
+        batch = texts[:n]
+        assert teacher.estimate_calls(batch, words, model, 1, None, cached_prompt=True) == \
+            teacher.estimate_calls(batch, words, model, 1, None)
+
+
+def test_a_dry_run_quotes_the_cached_price(priced, tmp_path):
+    from conftest import make_pool, make_seed
+
+    from shrewd import Project
+
+    proj = Project(tmp_path / "p", instructions="Route tickets.", labels=LABELS,
+                   teacher="anthropic/claude-haiku-5-5")
+    proj.add_seed(make_seed())
+    prompt = "x" * 8000
+    (proj.dir / "prompt.txt").write_text(prompt)
+    pool = make_pool()
+    quote = proj.label(pool, dry_run=True)["estimated_usd"]
+    _, full = teacher.estimate_calls(pool["text"].tolist(), prompt,
+                                     "anthropic/claude-haiku-5-5", 1, None)
+    assert quote < full
+    assert quote == pytest.approx(teacher.estimate_calls(
+        pool["text"].tolist(), prompt, "anthropic/claude-haiku-5-5", 1, None,
+        cached_prompt=True)[1])

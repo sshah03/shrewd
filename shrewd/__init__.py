@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from shrewd.students import load as load
     from shrewd.students import prune as prune
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "Choice", "Decisions", "DistillResult", "Finding", "Noul", "Project", "Score",
