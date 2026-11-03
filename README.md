@@ -111,6 +111,7 @@ pip install shrewd                 # inference only: sklearn stack, no LLM libra
 pip install "shrewd[teacher,embed]"     # + model2vec static-embedding student (no torch)
 pip install "shrewd[teacher,setfit]"    # + SetFit student (torch, best few-shot)
 pip install "shrewd[teacher,encoder]"   # + fine-tuned ModernBERT (torch, strongest at 1k+ rows)
+pip install "shrewd[onnx]"              # + exporting encoder and SetFit models to ONNX
 ```
 
 ## Compile a classifier
@@ -370,6 +371,64 @@ etc.) were only ever answered by the teacher, and ship that way.
   validation set. The final scores come from the separate holdout. Question definitions are
   in `examples/panels/panels.py`. Copy one and change the questions to make your own.
 
+## Run it without shrewd
+
+`export()` writes the shipped model into a folder you can copy into any project:
+
+```python
+import shrewd
+
+shrewd.export("runs/tickets", "tickets-model")
+```
+
+- **tf-idf and embedding models** (classifiers and panels) come out as `model.json` and
+  `weights.safetensors`, with a small runtime next to them. `shrewd_model.py` needs only
+  numpy, and `shrewd_model.js` needs nothing (Node, Deno, Bun or a browser). The calls are
+  the same as `load()`'s: `Model(folder).predict(texts)`, or `.decide(text)` for a panel.
+  `precision="float16"` stores an embedding model in about 15 MB instead of 30.
+- **Encoder and SetFit classifiers** come out as ONNX: `format="onnx"` writes `model.onnx`
+  and the `tokenizer.json` it expects, for any ONNX runtime. Encoders can also come out as a
+  Hugging Face folder that `transformers` loads directly, with `format="hf"`.
+- **Each export is checked** against `load()` on the project's own documents before it
+  returns, and comes with a README showing how to run it.
+- **Not yet:** panels built on an encoder, and panels that stack a zero-shot model.
+- **The teacher fallback stays in shrewd.** If the model was shipped with a routing
+  threshold, it's saved as metadata, and `model.confident(texts)` says which texts clear it.
+
+## Serving it
+
+Load the model once when your service starts, not on every request, and pass texts in
+batches. One call with 1,000 texts is much faster than 1,000 calls. A minimal endpoint:
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+from shrewd import load            # or, for an export: from shrewd_model import Model
+
+model = load("runs/tickets")
+app = FastAPI()
+
+
+class Texts(BaseModel):
+    texts: list[str]
+
+
+@app.post("/classify")
+def classify(body: Texts):
+    return {"labels": model.predict(body.texts)}
+```
+
+Run it with `uvicorn serve:app --workers 2`. Each worker loads its own copy.
+
+- **Panels:** return `[{k: a.payload for k, a in row.items()} for row in model.decide(texts)]`,
+  which is plain JSON.
+- **Memory:** tf-idf models take a few MB, embedding models about 30 MB, and encoders about
+  600 MB. Encoders also want a GPU for heavy traffic.
+- **Shipping a shrewd project:** `prune(dir)` first, which drops the pool, the test set and
+  the cache. shrewd pins scikit-learn, and saved models load with that version. Exports have
+  no such pin.
+
 ## API
 
 | | |
@@ -394,6 +453,7 @@ etc.) were only ever answered by the teacher, and ship that way.
 | `.promote(name)` | ship a compared candidate so that `load()` serves it |
 | `load(dir)` | inference-only classifier: `predict(texts, min_confidence=0.0, route=False, fallback=None)` / `local(texts)` / `predict_proba` / `classes_` / `labels` |
 | `prune(dir, dry_run=False, keep=())` | delete what a shipped project no longer needs. `load()` and `.ask` still work; labeling and retraining don't |
+| `export(dir, out_dir, format="auto", precision="float32", check=True, overwrite=False)` | write the shipped model so it runs without shrewd: `"plain"` (numpy or JavaScript), `"onnx"` or `"hf"`. See [Run it without shrewd](https://github.com/sshah03/shrewd#run-it-without-shrewd) |
 | `autotune(dir, instructions, labels, seed_df, pool_df, budget_usd=, target=None, ...)` | the ladder above, automated under a spending cap |
 
 **Calibrated decisions**

@@ -44,6 +44,7 @@ teacher = ["litellm>=1.70", "gepa==0.1.4"]
 embed = ["model2vec>=0.3,<0.10"]
 setfit = ["setfit>=1.1", "transformers<5"]
 encoder = ["torch>=2.2", "transformers>=4.48,<5"]
+onnx = ["onnx>=1.15", "onnxruntime>=1.17"]
 all = [
     "litellm>=1.70", "gepa==0.1.4",
     "model2vec>=0.3,<0.10", "setfit>=1.1", "torch>=2.2", "transformers>=4.48,<5",

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from shrewd._autotune import autotune as autotune
+    from shrewd._export import export as export
     from shrewd.decide import Choice as Choice
     from shrewd.decide import Noul as Noul
     from shrewd.decide import Score as Score
@@ -14,11 +15,11 @@ if TYPE_CHECKING:
     from shrewd.students import load as load
     from shrewd.students import prune as prune
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "Choice", "Decisions", "DistillResult", "Finding", "Noul", "Project", "Score",
-    "autotune", "load", "prune",
+    "autotune", "export", "load", "prune",
 ]
 
 
@@ -53,6 +54,10 @@ def __getattr__(name):
             from shrewd._autotune import autotune
 
         return autotune
+    if name == "export":
+        from shrewd._export import export
+
+        return export
     if name in ("load", "prune"):
         from shrewd import students
 
